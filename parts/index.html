@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ellsworth Parts</title>
+<meta name="description" content="Filters, teeth and service parts in stock. Works with no signal.">
+<meta name="theme-color" content="#1E3346">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Parts">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<meta name="robots" content="noindex, nofollow">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="appbar">
+  <div class="appbar-in">
+    <div class="brand">
+      <div class="brand-mark" id="brandMark" aria-hidden="true">PT</div>
+      <div class="brand-text"><h1 id="brandName">Parts</h1><p id="subline">Loading…</p></div>
+    </div>
+    <button class="me-btn" id="meBtn" data-tab="me" aria-pressed="false" aria-label="You: sync, app lock and backup" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"></path></svg><span id="meName">Me</span>
+    </button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="App sections" hidden>
+      <button class="tab" role="tab" id="tab-parts" data-tab="parts" aria-selected="true">Parts</button>
+      <button class="tab" role="tab" id="tab-machines" data-tab="machines" aria-selected="false">Machines</button>
+      <button class="tab" role="tab" id="tab-order" data-tab="order" aria-selected="false">Order <span class="count" id="orderCount" hidden></span></button>
+      <button class="tab" role="tab" id="tab-history" data-tab="history" aria-selected="false">History</button>
+    </nav>
+  </div>
+</header>
+<main class="layout" id="layout" hidden>
+  <section class="pane-list" aria-label="Lists">
+    <div id="view-parts" class="stack">
+      <div class="tools">
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+          <input id="q" class="search" type="search" placeholder="Part number, machine or type" aria-label="Search parts" autocomplete="off" autocapitalize="off" spellcheck="false">
+        </div>
+        <div class="chips" id="stChips" role="group" aria-label="Show parts by how many are left"></div>
+      </div>
+      <div id="partsBody" class="stack"></div>
+    </div>
+    <div id="view-machines" class="stack" hidden>
+      <div class="search-wrap">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+        <input id="mq" class="search" type="search" placeholder="Machine name or ID" aria-label="Find a machine" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div id="machBody" class="stack"></div>
+    </div>
+    <div id="view-order" class="stack" hidden></div>
+    <div id="view-history" class="stack" hidden></div>
+    <div id="view-me" class="stack" hidden></div>
+  </section>
+  <section class="pane-detail" id="detail" aria-label="Details"></section>
+</main>
+<main class="signin" id="signin" hidden></main>
+<div class="lock" id="lock" role="dialog" aria-modal="true" aria-label="App lock" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite"><span id="toastText"></span><button type="button" class="toast-act" id="toastAct" hidden></button></div>
+<noscript><p style="padding:16px">Parts needs JavaScript turned on.</p></noscript>
+<script src="version.js"></script>
+<script src="config.js"></script>
+<script src="store.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
