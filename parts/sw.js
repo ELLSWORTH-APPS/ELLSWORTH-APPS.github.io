@@ -1,7 +1,7 @@
 /* Parts background helper. It keeps a copy of the app on this phone so the app opens with no signal, and on
    Android it sends waiting updates by itself once there's service, even with the app closed.
    The build fills in the version and file list below; a new version replaces the old copy. */
-self.PL_VERSION = "2026.10.26-2e41f7";
+self.PL_VERSION = "2026.10.30-64fc05";
 importScripts("store.js");
 
 const CACHE = "pl-" + self.PL_VERSION;

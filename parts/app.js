@@ -37,7 +37,7 @@
   const DETAIL_FIELDS = ["pn", "alt", "desc", "type", "where", "min", "notes"];
 
   const S = {
-    phase: "boot",   // boot | setup | app
+    phase: "boot",   // boot | setup | stuck (storage not answering, code saved) | app
     me: { name: "", isOwner: true },
     parts: new Map(), moves: [], machines: [], machineById: new Map(), loaded: false,
     tab: "parts", q: "", mq: "", st: "all", hFilter: "all", hPart: null, hMore: 0,
@@ -313,7 +313,15 @@
     const again = D.again; D.again = null;
     if (!r || !r.ok) {
       const err = r ? r.error : "";
-      if (err === "bad_key") { S.keyBad = true; D.offline = false; render(true); return; }
+      if (err === "bad_key") {
+        // Twice in a row before pausing, so one odd answer from the sheet never asks for the code.
+        D.badKeys = (D.badKeys || 0) + 1;
+        if (D.badKeys < 2) { schedule(4000); return; }
+        S.keyBad = true; D.offline = false;
+        if (!D.loaded) { S.keyBad = false; D.badKeys = 0; S.phase = "setup"; render(); return; }   // nothing downloaded yet: the code changed, so ask for the new one
+        render(true); return;
+      }
+      if (err === "not_setup" && D.setup) M.set("setup", D.setup).catch(() => { /* next try */ });
       D.fails++;
       D.offline = !!(r && r.offline);
       if (err === "busy") { renderHeader(); schedule(3000); return; }
@@ -323,7 +331,7 @@
       schedule(navigator.onLine === false ? 60000 : Math.min(60000, 5000 * D.fails));
       return;
     }
-    D.fails = 0; D.offline = false; D.lastOk = Date.now();
+    D.fails = 0; D.badKeys = 0; D.offline = false; D.lastOk = Date.now();
     (r.rejected || []).forEach(x => toast("Couldn't save one update: " + ((x && x.why) || "the sheet turned it down")));
     render(true);
     if (opts.user) toast(D.outbox.length ? "Still sending…" : "Everything's synced with your sheet.");
@@ -336,26 +344,87 @@
     S.tab = "parts";   // the app always opens on the parts list, where Back stays put
     registerSW();
     wireLifecycle();
-    let setup = null, base = null, outbox = [], pin = null, lastOk = 0;
-    try { [setup, base, outbox, pin, lastOk] = await Promise.all([M.get("setup"), M.get("base"), M.get("outbox"), M.get("pin"), M.get("lastOk")]); }
-    catch (e) { S.storageError = true; }
-    D.setup = setup || null;
-    D.outbox = Array.isArray(outbox) ? outbox : [];
-    L.pin = pin || null;
-    D.lastOk = lastOk || 0;
+    // What's saved on this phone. The setup code also has a spare copy, so a phone whose storage hiccups
+    // (it happens on iPhones right after the app comes back) never asks for the code again.
+    const saved = await readSaved();
+    const spare = goodSetup(lsGet("setup", null));
+    const reloaded = reloadedForStorage();
+    if (!saved.ok && spare) {
+      if (!reloaded) { reloadForStorage(); return; }   // a fresh start of the page usually clears it up
+      S.phase = "stuck"; render(); waitForStorage(); return;
+    }
+    if (!saved.ok) S.storageError = true;
+    let setup = goodSetup(saved.setup);
+    if (!setup && spare && saved.ok) {   // storage lost the setup but the spare copy has it: put it back
+      setup = spare;
+      try { await M.set("setup", setup); } catch (e) { /* the first sync puts it back */ }
+    }
+    D.setup = setup;
+    D.outbox = Array.isArray(saved.outbox) ? saved.outbox : [];
+    L.pin = goodPin(saved.pin) || goodPin(lsGet("pin", null));
+    if (L.pin && !goodPin(saved.pin) && saved.ok) M.set("pin", L.pin).catch(() => { /* next change */ });
+    D.lastOk = saved.lastOk || 0;
+    const base = saved.base;
     if (base && base.state) loadState(base.state, base.ver, base.at);
     // If this copy of the app now points at a different sync link, use it.
     if (D.setup && CFG.syncUrl && D.setup.url !== CFG.syncUrl) {
       D.setup = Object.assign({}, D.setup, { url: CFG.syncUrl });
       M.set("setup", D.setup).catch(() => { /* next time */ });
     }
-    if (!D.setup || !D.loaded) { S.phase = "setup"; render(); return; }
-    S.phase = "app";
+    if (D.setup) { lsSet("setup", spareOf(D.setup)); keepStorage(); }
+    if (L.pin) lsSet("pin", L.pin);
+    if (!D.setup) { S.phase = "setup"; render(); return; }
+    S.phase = "app";   // with no copy of the parts list yet, it shows Loading and downloads it with the saved code
     derive();
     navStart();
     if (shouldLock()) openLock("unlock");
     render();
     sync({ full: true });
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const goodSetup = x => (x && typeof x === "object" && normKey(x.key).length === 12 && typeof x.url === "string" && /^https?:\/\//.test(x.url) ? x : null);
+  const goodPin = x => (x && typeof x === "object" && typeof x.salt === "string" && typeof x.hash === "string" && x.hash ? x : null);
+  const spareOf = st => ({ key: st.key, url: st.url, device: st.device || "", at: st.at || Date.now() });
+  // A few quick tries, each on a fresh connection, before deciding this phone's storage isn't answering.
+  async function readSaved() {
+    const waits = [0, 400, 1200];
+    for (let i = 0; i < waits.length; i++) {
+      if (i) { M.reset(); await sleep(waits[i]); }
+      try {
+        const all = Promise.all(["setup", "base", "outbox", "pin", "lastOk"].map(k => M.get(k)));
+        all.catch(() => { /* handled below */ });
+        const got = await Promise.race([all, sleep(9000).then(() => null)]);
+        if (!got) continue;   // stuck: start over on a fresh connection
+        const [setup, base, outbox, pin, lastOk] = got;
+        return { ok: true, tries: i + 1, setup, base, outbox, pin, lastOk };
+      } catch (e) { /* try again */ }
+    }
+    return { ok: false, tries: waits.length };
+  }
+  function reloadedForStorage() {
+    let at = 0;
+    try { at = Number(sessionStorage.getItem("pl.storageReload")) || 0; sessionStorage.removeItem("pl.storageReload"); } catch (e) { /* none */ }
+    return Date.now() - at < 120000;
+  }
+  function reloadForStorage() {
+    try { sessionStorage.setItem("pl.storageReload", String(Date.now())); } catch (e) { /* reload anyway */ }
+    location.reload();
+  }
+  // Still not answering after a fresh start: a screen that keeps trying by itself (the code is safe, nothing to type).
+  function waitForStorage() {
+    setTimeout(async () => {
+      if (S.phase !== "stuck") return;
+      M.reset();
+      try { await M.get("setup"); location.reload(); } catch (e) { waitForStorage(); }
+    }, 3000);
+  }
+  // Asks the phone to keep the app's storage even when it runs low on space.
+  function keepStorage() {
+    try {
+      const sm = navigator.storage;
+      if (sm && sm.persist) (sm.persisted ? sm.persisted() : Promise.resolve(false)).then(p => p || sm.persist()).catch(() => { /* best effort */ });
+    } catch (e) { /* best effort */ }
   }
 
   function wireLifecycle() {
@@ -445,7 +514,9 @@
       if (btn) btn.textContent = "Connect";
       return showWarn(form, "setupWarn", "This phone wouldn't let the app save anything. In Safari, private browsing blocks it.");
     }
-    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* best effort */ }
+    lsSet("setup", spareOf(setup));
+    keepStorage();
+    S.storageError = false;
     D.setup = setup;
     D.lastOk = Date.now();
     loadState(res.state, res.ver, 0);
@@ -566,6 +637,7 @@
         const pin = { salt, hash: await pinHash(salt, entry), after: L.pin && L.pin.after !== undefined ? L.pin.after : 15 * 60000 };
         try { await M.set("pin", pin); } catch (e) { L.msg = "Couldn't save the PIN on this phone."; L.bad = true; L.mode = "new"; L.entry = ""; return renderLock(); }
         L.pin = pin;
+        lsSet("pin", pin);
         closeLock();
         toast("PIN saved. The app asks for it after you've been away 15 minutes. You can change that under the person button.");
       }
@@ -587,7 +659,7 @@
     $("#tabs").hidden = !ready;
     $("#meBtn").hidden = !ready;
     renderHeader();
-    if (!ready) { if (S.phase === "setup") renderSignin(); return; }
+    if (!ready) { if (S.phase === "setup") renderSignin(); else if (S.phase === "stuck") renderStuck(); return; }
     TAB_IDS.forEach(t => $("#tab-" + t).setAttribute("aria-selected", String(S.tab === t)));
     $("#meBtn").setAttribute("aria-pressed", String(S.tab === "me"));
     TABS.forEach(t => { $("#view-" + t).hidden = S.tab !== t; });
@@ -606,7 +678,7 @@
     const waiting = D.outbox.length;
     const off = isOffline();
     const ups = k => k + " update" + (k === 1 ? "" : "s");
-    if (S.phase === "boot") text = "Loading…";
+    if (S.phase === "boot" || S.phase === "stuck") text = "Loading…";
     else if (S.phase === "setup") text = "Set up this phone";
     else if (!D.loaded) text = "Loading parts…";
     else if (S.keyBad) { text = "Sync paused, setup code changed"; warn = true; }
@@ -633,6 +705,16 @@
     const iosSteps = `<div><div class="os">iPhone</div><ol><li>Open this page in <b>Safari</b>.</li><li>Tap the Share button ${SHARE_SVG}, then <b>Add to Home Screen</b>.</li><li>Open <b>Parts</b> from your home screen and set it up there.</li></ol></div>`;
     const andSteps = `<div><div class="os">Android</div><ol><li>In <b>Chrome</b>, tap the ⋮ menu, then <b>Add to Home screen</b> or <b>Install app</b>.</li><li>Open <b>Parts</b> from your home screen.</li></ol></div>`;
     return `<div class="install-steps">${ios ? iosSteps : android ? andSteps : iosSteps + andSteps}</div>`;
+  }
+
+  function renderStuck() {
+    $("#signin").innerHTML = `<div class="card card-pad signin-card setup-card">
+      <div class="brand-mark lg" aria-hidden="true">PT</div>
+      <h2>Opening your parts list</h2>
+      <p>This phone's storage isn't answering right now. Your setup code is still saved, so there's nothing to type.</p>
+      <p class="muted">The app keeps trying by itself. If this stays up, close the app all the way and open it again.</p>
+      <div class="row-actions"><button class="btn primary wide" type="button" data-action="reload-app">Try again</button></div>
+    </div>`;
   }
 
   function renderSignin() {
@@ -725,7 +807,7 @@
   }
   function renderParts() {
     const body = $("#partsBody");
-    if (!S.loaded) { body.innerHTML = `<div class="card empty"><h3>Loading parts</h3></div>`; return; }
+    if (!S.loaded) { body.innerHTML = `<div class="card empty"><h3>Loading parts</h3>${isOffline() ? "<p>No signal right now. It all downloads by itself once there's service.</p>" : ""}</div>`; return; }
     const all = activeParts();
     const n = k => all.filter(p => stockOf(p).st === k).length;
     const chips = [["all", "All", all.length], ["out", "Out", n("out")], ["low", "Low", n("low")], ["none", "Not counted", n("none")]];
@@ -983,6 +1065,7 @@
     catch (e) { setFormBusy(form, false); return showWarn(form, "newKeyWarn", "Couldn't reach your sheet. Check your signal and try again."); }
     if (!res || !res.ok) { setFormBusy(form, false); return showWarn(form, "newKeyWarn", res && res.error === "bad_key" ? "That code doesn't work." : "Your sheet had a problem. Try again in a minute."); }
     D.setup = Object.assign({}, D.setup, { key: code });
+    lsSet("setup", spareOf(D.setup));
     await M.set("setup", D.setup);
     S.keyBad = false;
     toast("Code saved. Syncing now.");
@@ -1010,7 +1093,7 @@
       return;
     }
     try { await M.clearAll(); } catch (e) { /* reload anyway */ }
-    ["seenAt", "tipDone", "countTipDone"].forEach(lsDel);
+    ["seenAt", "tipDone", "countTipDone", "setup", "pin"].forEach(lsDel);
     location.reload();
   }
 
@@ -1662,6 +1745,7 @@
     if (el.id === "lockAfter" && L.pin) {
       L.pin = Object.assign({}, L.pin, { after: Number(el.value) });
       M.set("pin", L.pin).catch(() => { /* try again next change */ });
+      lsSet("pin", L.pin);
       lsSet("seenAt", Date.now());
       toast(L.pin.after < 0 ? "The app won't ask for your PIN." : L.pin.after === 0 ? "The app asks for your PIN every time you open it." : "Saved.");
       renderMe();
