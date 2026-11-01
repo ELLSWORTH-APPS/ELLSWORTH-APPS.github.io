@@ -1,1 +1,1 @@
-self.PL_VERSION = "2026.10.30-64fc05";
+self.PL_VERSION = "2026.11.01-943047";

@@ -59,6 +59,7 @@
 
   const firstName = n => String(n || "").trim().split(/\s+/)[0] || "";
   const normKey = s => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const fmtKey = c => (c && c.length === 12 ? c.slice(0, 4) + "-" + c.slice(4, 8) + "-" + c.slice(8) : c || "");
   const isOffline = () => D.offline || navigator.onLine === false;
   const clone = o => JSON.parse(JSON.stringify(o));
   function numOrNull(x) {
@@ -349,13 +350,14 @@
     const saved = await readSaved();
     const spare = goodSetup(lsGet("setup", null));
     const reloaded = reloadedForStorage();
-    if (!saved.ok && spare) {
-      if (!reloaded) { reloadForStorage(); return; }   // a fresh start of the page usually clears it up
-      S.phase = "stuck"; render(); waitForStorage(); return;
+    if (!saved.ok) {
+      // Storage that doesn't answer never means setting up again. A fresh start of the page usually clears it up;
+      // after that, a screen that keeps trying by itself.
+      if (!reloaded) { reloadForStorage(); return; }
+      S.phase = "stuck"; S.stuckAt = Date.now(); S.stuckSpare = !!spare; render(); waitForStorage(); return;
     }
-    if (!saved.ok) S.storageError = true;
     let setup = goodSetup(saved.setup);
-    if (!setup && spare && saved.ok) {   // storage lost the setup but the spare copy has it: put it back
+    if (!setup && spare) {   // storage lost the setup but the spare copy has it: put it back
       setup = spare;
       try { await M.set("setup", setup); } catch (e) { /* the first sync puts it back */ }
     }
@@ -373,13 +375,20 @@
     }
     if (D.setup) { lsSet("setup", spareOf(D.setup)); keepStorage(); }
     if (L.pin) lsSet("pin", L.pin);
-    if (!D.setup) { S.phase = "setup"; render(); return; }
+    if (!D.setup) {
+      // Nothing saved on this phone at all. If the phone's saved passwords have the code, set up with it.
+      S.phase = "setup";
+      if (await setupFromSaved()) return;
+      render();
+      return;
+    }
     S.phase = "app";   // with no copy of the parts list yet, it shows Loading and downloads it with the saved code
     derive();
     navStart();
     if (shouldLock()) openLock("unlock");
     render();
     sync({ full: true });
+    if (!lsGet("pmSaved", false)) setTimeout(() => { if (D.setup) rememberCode(D.setup.key); }, 4000);
   }
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -412,12 +421,50 @@
     location.reload();
   }
   // Still not answering after a fresh start: a screen that keeps trying by itself (the code is safe, nothing to type).
+  // Offers to set the phone up again after half a minute, in case this phone's storage never answers.
   function waitForStorage() {
     setTimeout(async () => {
       if (S.phase !== "stuck") return;
       M.reset();
-      try { await M.get("setup"); location.reload(); } catch (e) { waitForStorage(); }
-    }, 3000);
+      try { await M.get("setup"); location.reload(); }
+      catch (e) {
+        if (!S.stuckLong && Date.now() - S.stuckAt > 25000) { S.stuckLong = true; renderStuck(); }
+        waitForStorage();
+      }
+    }, 2500);
+  }
+
+  // The phone's saved passwords (Google Password Manager on Android) keep a copy of the code, apart from the app's
+  // own storage. If the phone ever wipes the app's storage, the app gets the code back from there by itself.
+  function rememberCode(code) {
+    if (!window.PasswordCredential || !navigator.credentials || !navigator.credentials.store || normKey(code).length !== 12) return;
+    try {
+      const who = (D.config && D.config.name) || "";
+      const c = new PasswordCredential({ id: (who ? who + " - " : "") + "Parts", password: fmtKey(normKey(code)), name: "Parts setup code" });
+      navigator.credentials.store(c).then(() => lsSet("pmSaved", true)).catch(() => { /* not saved this time */ });
+    } catch (e) { /* not on this phone */ }
+  }
+  async function savedCode(silent) {
+    if (!window.PasswordCredential || !navigator.credentials || !navigator.credentials.get) return "";
+    try {
+      const ask = navigator.credentials.get({ password: true, mediation: silent ? "silent" : "optional" });
+      ask.catch(() => { /* handled below */ });
+      const c = await Promise.race([ask, sleep(silent ? 5000 : 120000).then(() => null)]);
+      const code = c && c.type === "password" ? normKey(c.password) : "";
+      return code.length === 12 ? code : "";
+    } catch (e) { return ""; }
+  }
+  async function setupFromSaved() {
+    if (!CFG.syncUrl || navigator.onLine === false) return false;
+    const code = await savedCode(true);
+    if (!code) return false;
+    S.autoSetup = true;
+    render();
+    const r = await connect(code, "keychain");
+    S.autoSetup = false;
+    if (r.ok) return true;
+    S.setupNote = r.bad ? "The code saved on this phone didn't work. Type the one from your sheet." : r.why;
+    return false;
   }
   // Asks the phone to keep the app's storage even when it runs low on space.
   function keepStorage() {
@@ -489,20 +536,30 @@
     showWarn(form, "setupWarn", "");
     const btn = form.querySelector("button[type=submit]");
     if (btn) btn.textContent = "Downloading the parts list…";
+    const r = await connect(code, "setup");
+    if (r.ok) return;
+    setFormBusy(form, false);
+    if (btn) btn.textContent = "Connect";
+    showWarn(form, "setupWarn", r.why);
+  }
+  async function useSavedCode() {
+    const code = await savedCode(false);
+    const inp = $("#setupCode");
+    if (!code) { toast("No code saved on this phone yet."); return; }
+    if (inp) { inp.value = fmtKey(code); const f = inp.closest("form"); if (f) doSetup(f); }
+  }
+
+  // Signs this phone in with a setup code: downloads everything, saves it on the phone and opens the app.
+  async function connect(code, why) {
     const device = newId("D");
     let res;
     try { res = await M.post(CFG.syncUrl, { key: code, device, app: VERSION, full: true, ops: [] }, 60000); }
     catch (e) {
-      setFormBusy(form, false);
-      if (btn) btn.textContent = "Connect";
-      return showWarn(form, "setupWarn", e && e.server ? "Your sheet's sync link had a problem: " + e.message
-        : "Couldn't reach your sheet. Check your signal and try again.");
+      return { ok: false, why: e && e.server ? "Your sheet's sync link had a problem: " + e.message : "Couldn't reach your sheet. Check your signal and try again." };
     }
     if (!res || !res.ok || !res.state) {
-      setFormBusy(form, false);
-      if (btn) btn.textContent = "Connect";
-      return showWarn(form, "setupWarn", res && res.error === "bad_key" ? "That code doesn't work. Check it and try again."
-        : "Your sheet had a problem" + (res && res.message ? ": " + res.message : "") + ". Try again in a minute.");
+      const bad = !!(res && res.error === "bad_key");
+      return { ok: false, bad, why: bad ? "That code doesn't work. Check it and try again." : "Your sheet had a problem" + (res && res.message ? ": " + res.message : "") + ". Try again in a minute." };
     }
     const setup = { key: code, url: CFG.syncUrl, device, at: Date.now() };
     try {
@@ -510,13 +567,12 @@
       await M.set("base", { ver: String(res.ver || ""), state: res.state, at: Date.now() });
       await M.set("lastOk", Date.now());
     } catch (e) {
-      setFormBusy(form, false);
-      if (btn) btn.textContent = "Connect";
-      return showWarn(form, "setupWarn", "This phone wouldn't let the app save anything. In Safari, private browsing blocks it.");
+      return { ok: false, why: "This phone wouldn't let the app save anything. In Safari, private browsing blocks it." };
     }
     lsSet("setup", spareOf(setup));
     keepStorage();
     S.storageError = false;
+    S.setupNote = "";
     D.setup = setup;
     D.lastOk = Date.now();
     loadState(res.state, res.ver, 0);
@@ -525,11 +581,13 @@
     S.tab = "parts";
     navStart();
     lsSet("seenAt", Date.now());
-    if (!L.pin) openLock("new", true);
+    if (!L.pin && why === "setup") openLock("new", true);
     render();
     const n = activeParts().length;
-    toast(`All set. ${plural(n, "part")} ${n === 1 ? "is" : "are"} saved on this phone.`);
+    toast(why === "keychain" ? "Set up again with the code saved on this phone." : `All set. ${plural(n, "part")} ${n === 1 ? "is" : "are"} saved on this phone.`);
     schedule(POLL_MS);
+    if (why === "setup") setTimeout(() => rememberCode(code), L.open ? 1500 : 300);
+    return { ok: true };
   }
 
   // ---------------------------------------------------------------- PIN lock
@@ -711,14 +769,21 @@
     $("#signin").innerHTML = `<div class="card card-pad signin-card setup-card">
       <div class="brand-mark lg" aria-hidden="true">PT</div>
       <h2>Opening your parts list</h2>
-      <p>This phone's storage isn't answering right now. Your setup code is still saved, so there's nothing to type.</p>
+      <p>This phone's storage is slow to answer right now. ${S.stuckSpare ? "Your setup code is still saved, so there's nothing to type." : "Everything is still saved on this phone; the app just can't open it yet."}</p>
       <p class="muted">The app keeps trying by itself. If this stays up, close the app all the way and open it again.</p>
       <div class="row-actions"><button class="btn primary wide" type="button" data-action="reload-app">Try again</button></div>
+      ${S.stuckLong ? `<p class="muted small">Still stuck after closing and opening it? <button class="link" type="button" data-action="setup-anyway">Set this phone up again</button></p>` : ""}
     </div>`;
   }
 
   function renderSignin() {
     const el = $("#signin");
+    if (S.autoSetup) {
+      el.dataset.v = "auto";
+      el.innerHTML = `<div class="card card-pad signin-card setup-card"><div class="brand-mark lg" aria-hidden="true">PT</div>
+        <h2>Setting up this phone</h2><p>Using the setup code saved on this phone, and downloading the parts list.</p></div>`;
+      return;
+    }
     if (el.querySelector("form[data-form='setup']") && el.dataset.v === String(!!S.installEvt)) return;   // keep what they're typing
     el.dataset.v = String(!!S.installEvt);
     const ios = isIOS(), app = standalone();
@@ -736,8 +801,9 @@
     html += `<p>Type the setup code you were given. It's the same code as the Machine List app. You only do this once on each phone, and it needs signal to download the parts list.</p>
       <form class="editor" data-form="setup" autocomplete="off">
         <label for="setupCode">Setup code<input id="setupCode" name="code" class="code-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="14" placeholder="XXXX-XXXX-XXXX"></label>
-        <p class="warn" id="setupWarn" hidden></p>
+        <p class="warn" id="setupWarn"${S.setupNote ? "" : " hidden"}>${esc(S.setupNote || "")}</p>
         <div class="row-actions"><button class="btn primary wide" type="submit">Connect</button></div>
+        ${window.PasswordCredential ? `<div class="row-actions"><button class="btn quiet wide" type="button" data-action="use-saved">Use the code saved on this phone</button></div>` : ""}
       </form>
       ${CFG.syncUrl ? "" : `<p class="warn-text">This copy of the app isn't linked to your sheet yet.</p>`}
       <p class="muted small">After this, the app works with no signal. What you do goes to your sheet by itself once you have service.</p>
@@ -1716,6 +1782,8 @@
     if (a === "reset") return resetPhone();
     if (a === "check-update") { toast("Checking for an app update…"); return checkForUpdate(true); }
     if (a === "reload-app") return location.reload();
+    if (a === "setup-anyway") { S.phase = "setup"; S.storageError = true; return render(); }
+    if (a === "use-saved") return useSavedCode();
     if (a === "install") {
       const ev = S.installEvt;
       if (!ev) return;
