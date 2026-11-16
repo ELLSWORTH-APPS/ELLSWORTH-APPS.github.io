@@ -1,0 +1,1 @@
+self.JP_VERSION = "2026.11.16-7ca1b5";
