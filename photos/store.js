@@ -306,7 +306,9 @@
       await fixJobNumbers();
       const ready = readyOps(await get("outbox"));
       if (!ready.length) return { ok: true, sent };
-      const batch = ready[0].t === "photo" ? ready.filter(o => o.t === "photo").slice(0, width) : [ready[0]];
+      const seen = new Set();
+      const batch = (ready[0].t === "photo" ? ready.filter(o => o.t === "photo") : [ready[0]])
+        .filter(o => !seen.has(o.id) && seen.add(o.id)).slice(0, width);   // never the same photo twice at once
       const results = await Promise.all(batch.map(async op => {
         try {
           step({ op, phase: "start" });
@@ -319,6 +321,7 @@
         } catch (e) {
           if (e && e.offline) return "offline";
           if (e && e.code === "NOKEY") return "nokey";
+          if (e && e.code === "BUSY") return "busy";        // an earlier send of it is still being saved: ask again shortly
           await changeOp(op.id, o => Object.assign(o, { failed: true, err: (e && e.message) || "The sheet didn't take it." }));
           step({ op, phase: "failed", error: e });
           return "failed";
@@ -327,6 +330,7 @@
       sent += results.filter(r => r === "ok").length;
       if (results.includes("nokey")) return { ok: false, nokey: true, sent };
       if (results.includes("offline")) return { ok: false, offline: true, sent };
+      if (results.includes("busy") && !results.includes("ok")) return { ok: false, busy: true, sent };
     }
     return { ok: true, sent };
   }

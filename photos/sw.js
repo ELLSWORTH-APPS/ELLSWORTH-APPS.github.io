@@ -1,7 +1,7 @@
 /* Job Photos background helper. It keeps a copy of the app itself (no photos) so the app opens with no signal,
    and on Android it sends waiting photos by itself once there's service, even with the app closed.
    The build fills in the version and file list below; a new version replaces the old copy. */
-self.JP_VERSION = "2026.11.20-dd912a";
+self.JP_VERSION = "2026.11.20-8b1d9e";
 importScripts("config.js", "store.js");
 
 const CACHE = "jp-" + self.JP_VERSION;

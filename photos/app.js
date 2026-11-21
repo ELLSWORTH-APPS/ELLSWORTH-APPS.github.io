@@ -29,6 +29,7 @@ const S = {
   batch: { total: 0, done: 0 },
   processing: [],                                // photos being got ready, not saved yet
   urls: new Map(),                               // blob key -> object URL
+  justSent: new Map(),                           // photo id -> the waiting photo's small picture, just sent
   noBlob: new Set(),                             // thumbnails the phone doesn't have yet
   installEvt: null, homeScroll: 0
 };
@@ -216,7 +217,7 @@ function memPut(key, blob) {
 
 
 // ================================================================ getting a photo ready (on the phone, before it's saved)
-const SIZES = { standard: 2560, full: 4096, view: 1600, thumb: 480 };
+const SIZES = { standard: 2048, full: 4096, view: 1600, thumb: 480 };   // Standard: sharp on any screen, and quick to send
 
 /** Date taken and GPS from a JPEG's EXIF block. Everything is optional. */
 async function readExif(file) {
@@ -323,7 +324,7 @@ function guessMime(file) {
 const isPhotoFile = f => /^image\//.test(guessMime(f));
 
 /**
- * What gets kept and sent for one photo: the photo itself (Standard = 2560 px; Full size = the untouched
+ * What gets sent for one photo: the photo itself (Standard = 2048 px; Full size = the untouched
  * original up to 15 MB, or 4096 px past that), a 1600 px copy for looking at, and a small thumbnail.
  */
 async function preparePhoto(file, size) {
@@ -351,7 +352,7 @@ async function preparePhoto(file, size) {
     } else {
       const big = size === "full";
       main = scaled(img, W, H, big ? SIZES.full : SIZES.standard);
-      mainBlob = await canvasBlob(main, big ? 0.92 : 0.86); outMime = "image/jpeg"; w = main.width; h = main.height;
+      mainBlob = await canvasBlob(main, big ? 0.92 : 0.85); outMime = "image/jpeg"; w = main.width; h = main.height;
     }
     const viewC = Math.max(main.width, main.height) > SIZES.view + 100 ? scaled(main, main.width, main.height, SIZES.view) : main;
     const view = (keepOriginal || viewC !== main) ? await canvasBlob(viewC, 0.8) : null;
@@ -511,9 +512,9 @@ function statusInfo() {
   if (S.syncing && waiting) return { cls: "busy", text: "Sending " + what + "…" };
   if (failed && failed === S.outbox.length && !S.processing.length) return { cls: "bad", text: failed + " didn't send. Tap to see why" };
   if (waiting && !S.online) return { cls: "wait", text: "No signal. " + what + " waiting to send" };
-  if (waiting) return { cls: "wait", text: what + " waiting to send" };
+  if (waiting) return { cls: "busy", text: "Sending " + what + "…" };   // with signal, waiting is just the gap between trips
   if (!S.online) return { cls: "", text: "No signal. Photos show with service" };
-  if (S.syncing) return { cls: "busy", text: "Checking for new photos…" };
+  // Looking for other people's new photos happens quietly: no "busy" here unless your own photos are going.
   return { cls: "ok", text: S.lastOk ? "Up to date, " + ago(S.lastOk) : "Up to date" };
 }
 function statusHTML() {
@@ -795,7 +796,7 @@ function sendingSheet() {
       : "Everything's in the cloud. Nothing is waiting on this phone."}${S.lastOk ? " Last good trip " + esc(ago(S.lastOk)) + "." : ""}</p>
     ${rows ? `<div>${rows}</div>` : ""}
     <div class="acts" style="margin-top:14px"><button class="btn line" data-x>Close</button>
-      <button class="btn tape" id="sendNow">${failedOps().length ? "Try again" : "Send now"}</button></div>`);
+      <button class="btn tape" id="sendNow">${failedOps().length ? "Try again" : ops.length ? "Send now" : "Check for new photos"}</button></div>`);
   $("[data-x]", el).onclick = () => closeSheet();
   $("#sendNow", el).onclick = async () => {
     await Promise.all(failedOps().map(o => DB.changeOp(o.id, x => Object.assign(x, { failed: false, err: "" }))));
@@ -817,7 +818,7 @@ function sendingSheet() {
 
 
 // ================================================================ thumbnails: from the cloud, held in memory while the app is open
-const TQ = { want: new Set(), busy: 0 };
+const TQ = { want: new Set(), busy: 0, tries: new Map() };
 function setBg(el, u) {
   el.style.backgroundImage = `url("${u}")`;
   el.dataset.painted = "1";
@@ -844,8 +845,10 @@ function pumpThumbs() {
         const u = memPut("t:" + id, DB.b64Blob(map[id], "image/jpeg"));
         $$(`[data-key="t:${CSS.escape(id)}"]`).forEach(el => setBg(el, u));
       }
-    }).catch(e => { if (e && e.offline) { S.online = false; batch.forEach(id => TQ.want.add(id)); renderStatus(); } })
-      .finally(() => { TQ.busy--; pumpThumbs(); });
+    }).catch(e => {
+      batch.forEach(id => { const n = (TQ.tries.get(id) || 0) + 1; TQ.tries.set(id, n); if (n < 3) TQ.want.add(id); });
+      if (e && e.offline && navigator.onLine === false) { S.online = false; renderStatus(); }   // a slow answer isn't "no signal"
+    }).finally(() => { TQ.busy--; setTimeout(pumpThumbs, TQ.want.size ? 50 : 0); });
   }
 }
 
@@ -877,7 +880,8 @@ function openJob(id) {
   S.view = "job"; S.jobId = id;
   window.scrollTo(0, 0);
   renderJob();
-  if (S.online && !S.syncing) kickSync();   // pick up anyone else's new photos
+  // pick up anyone else's new photos, at most once a minute
+  if (S.online && !S.syncing && (S.outbox.length || Date.now() - (S.lastOk || 0) > 60000)) kickSync();
 }
 function jobMapLink(j, items) {
   if (j.address) return mapsHref(j.address);
@@ -1301,7 +1305,7 @@ async function kickSync() {
   renderStatus();
   let r = null;
   try {
-    r = await DB.withLock(() => DB.syncAll({ parallel: isTouch ? 2 : 3, onStep: onSyncStep }));
+    r = await DB.withLock(() => DB.syncAll({ parallel: isTouch ? 3 : 4, onStep: onSyncStep }));
   } catch (e) { r = { ok: false, error: e && e.message }; }
   S.syncing = false;
   if (r && r.nokey) {
@@ -1313,20 +1317,33 @@ async function kickSync() {
   if (r && r.ok) S.lastErr = "";
   else if (r && r.error && !r.offline) S.lastErr = r.error;
   try { await loadLocal(); } catch (e) { /* storage hiccup: next round */ }
+  adoptThumbs();
   rerender();
   if (S.again) { S.again = false; setTimeout(kickSync, 300); }
   else if (S.outbox.some(o => !o.failed)) {
     registerBgSync();
     clearTimeout(S.retryT);
-    if (S.online) S.retryT = setTimeout(kickSync, 20000);
+    if (S.online) S.retryT = setTimeout(kickSync, r && r.busy ? 5000 : 20000);
   }
   if (S.reloadWhenIdle && !S.outbox.length && !S.processing.length) location.reload();
 }
 let stepT = null;
 function onSyncStep(e) {
-  if (e.phase === "done" && e.op.t === "photo") S.batch.done++;
+  if (e.phase === "done" && e.op.t === "photo") { S.batch.done++; S.justSent.set(e.op.pid, "q:" + e.op.id + ":t"); }
   clearTimeout(stepT);
-  stepT = setTimeout(async () => { try { await loadLocal(); } catch (x) { /* next time */ } softRender(); }, 400);
+  stepT = setTimeout(async () => { try { await loadLocal(); } catch (x) { /* next time */ } adoptThumbs(); softRender(); }, 400);
+}
+// A photo just sent keeps showing the small picture the phone already had on screen (in memory only),
+// instead of going blank until the cloud's copy loads.
+function adoptThumbs() {
+  if (!S.justSent.size) return;
+  list(S.data.photos).forEach(p => {
+    const qk = S.justSent.get(p.id);
+    if (!qk) return;
+    const u = S.urls.get(qk);
+    if (u && p.t && !S.urls.has("t:" + p.t)) { S.urls.set("t:" + p.t, u); S.urls.delete(qk); }
+    S.justSent.delete(p.id);
+  });
 }
 
 // Redraws what changed without jumping the screen around.
@@ -1359,7 +1376,7 @@ function renderBar() {
     l1 = `<span class="ic" style="color:var(--ok)">${icon("check")}</span><span class="grow">${S.batch.done} photo${S.batch.done === 1 ? "" : "s"} sent</span>`;
     pct = 100;
     clearTimeout(S.barT);
-    S.barT = setTimeout(() => { if (!waitingPhotos().length && !S.processing.length) { S.batch = { total: 0, done: 0 }; renderBar(); } }, 5000);
+    S.barT = setTimeout(() => { if (!waitingPhotos().length && !S.processing.length) { S.batch = { total: 0, done: 0 }; renderBar(); } }, 3000);
   } else {
     bar.classList.remove("ok");
     pct = total ? Math.round(100 * S.batch.done / total) : 0;
@@ -1367,9 +1384,12 @@ function renderBar() {
       l1 = `<span class="ic" style="color:var(--bad)">${icon("alert")}</span><span class="grow">${failed} didn't send</span><button class="btn small tape" id="barWhy">See why</button>`;
     } else if (S.syncing && S.online) {
       l1 = `<span class="spin"></span><span class="grow">Sending ${Math.min(S.batch.done + 1, total)} of ${total}</span>`;
-      l2 = isAndroid() ? "You can keep working. With signal it finishes even if you close the app." : "Keep the app open until it says sent.";
+      l2 = "You can keep working. Leave the app open until it says sent: it sends fastest that way.";
     } else if (S.processing.length) {
       l1 = `<span class="spin"></span><span class="grow">Getting ${S.processing.length} photo${S.processing.length === 1 ? "" : "s"} ready to send</span>`;
+    } else if (S.online) {                          // between trips: still sending, not waiting on signal
+      l1 = `<span class="spin"></span><span class="grow">Sending ${Math.min(S.batch.done + 1, total)} of ${total}</span>`;
+      l2 = "You can keep working. Leave the app open until it says sent: it sends fastest that way.";
     } else {
       l1 = `<span class="ic" style="color:var(--warn)">${icon("clock")}</span><span class="grow">${waiting} photo${waiting === 1 ? "" : "s"} waiting for signal</span><button class="btn small line" id="barWhy">Details</button>`;
       l2 = "They wait on this phone only until there's service" + (isIOS() ? " and the app is open" : "") + ", then they're sent and cleared off.";
@@ -1388,7 +1408,8 @@ function registerBgSync() {
 window.addEventListener("online", () => { S.online = true; renderStatus(); kickSync(); pumpThumbs(); });
 window.addEventListener("offline", () => { S.online = false; renderStatus(); });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && S.setup && Date.now() - (S.lastTry || 0) > 15000) { S.lastTry = Date.now(); kickSync(); }
+  if (document.visibilityState === "visible" && S.setup && Date.now() - (S.lastTry || 0) > 15000 &&
+      (S.outbox.length || Date.now() - (S.lastOk || 0) > 60000)) { S.lastTry = Date.now(); kickSync(); }
 });
 setInterval(() => {
   if (document.visibilityState !== "visible" || !S.setup || S.syncing) return;
@@ -1453,7 +1474,7 @@ async function planImport(el, files) {
       </tbody></table>
       ${other ? `<p class="muted">${other} file${other === 1 ? " isn't a photo" : "s aren't photos"} (videos, PDFs and such), so ${other === 1 ? "it stays" : "they stay"} on this computer.</p>` : ""}
       <label class="field"><span>Photo size</span><select id="impSize">
-        <option value="standard" ${S.size === "standard" ? "selected" : ""}>Standard (2560 px, sends fast)</option>
+        <option value="standard" ${S.size === "standard" ? "selected" : ""}>Standard (2048 px, sends fast)</option>
         <option value="full" ${S.size === "full" ? "selected" : ""}>Full size (the originals)</option></select></label>
       <button class="btn tape block" id="impGo" ${total ? "" : "disabled"}>${icon("upload")}Send ${total} photo${total === 1 ? "" : "s"}</button>`;
     $$("input[data-i]", box).forEach(c => c.onchange = () => { rows[+c.dataset.i].on = c.checked; draw(); });
