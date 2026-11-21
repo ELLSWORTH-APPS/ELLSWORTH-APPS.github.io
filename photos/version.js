@@ -1,1 +1,1 @@
-self.JP_VERSION = "2026.11.16-7ca1b5";
+self.JP_VERSION = "2026.11.20-dd912a";

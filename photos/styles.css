@@ -290,13 +290,8 @@ body { padding-top: env(safe-area-inset-top, 0px); padding-left: env(safe-area-i
 .qrow .qx b { display: block; font-size: 16px; }
 .qrow .qx span { display: block; font-size: 14px; color: var(--ink2); }
 .qrow .qx .why { color: var(--bad); }
-.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 14px; }
-.stats div { padding: 10px 12px; border-radius: var(--r1); background: var(--card); border: 1.5px solid var(--line); }
-.stats b { display: block; font-size: 22px; font-weight: 800; font-stretch: 74%; font-variant-numeric: tabular-nums; }
-.stats span { font-size: 13.5px; color: var(--ink2); }
-.saveline { display: flex; align-items: center; gap: 10px; margin: 2px 0 8px; color: var(--ink2); font-size: 14.5px; }
-.saveline .btn { flex: none; }
 .offnote { margin: 8px 0 0; padding: 9px 12px; border-radius: var(--r1); background: var(--card); border-left: 4px solid var(--warn); font-size: 14.5px; color: var(--ink2); }
 
-.saveline svg { width: 20px; height: 20px; flex: none; color: var(--ok); }
+.vmsg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(84%, 340px); margin: 0;
+  color: #fff; text-align: center; font-size: 17px; line-height: 1.4; }
 body.hasbar .toast { bottom: calc(150px + var(--safe-b)); }

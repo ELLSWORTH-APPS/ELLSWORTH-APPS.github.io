@@ -185,9 +185,12 @@ function goBack() {
   // on the job list already: stay put
 }
 
-// Object URLs for photos kept on this phone.
+// Object URLs for photos on screen. Photos from the cloud ("t:" small, "v:" big) are held in memory
+// only while the app is open, never saved on the phone. Only a photo still waiting to send ("q:")
+// is read from the phone's storage.
 async function blobURL(key) {
   if (S.urls.has(key)) return S.urls.get(key);
+  if (!String(key).startsWith("q:")) return "";
   let b = null;
   try { b = await DB.bget(key); } catch (e) { b = null; }
   if (!b) return "";
@@ -198,6 +201,16 @@ async function blobURL(key) {
 function dropURL(key) {
   const u = S.urls.get(key);
   if (u) { URL.revokeObjectURL(u); S.urls.delete(key); }
+}
+const MEM_MAX = { t: 600, v: 12 };               // how many cloud photos to hold in memory at once
+function memPut(key, blob) {
+  dropURL(key);
+  const u = URL.createObjectURL(blob);
+  S.urls.set(key, u);
+  const kind = String(key)[0], max = MEM_MAX[kind] || 0;
+  const mine = Array.from(S.urls.keys()).filter(k => k[0] === kind && k[1] === ":");
+  if (max && mine.length > max) mine.slice(0, mine.length - max).forEach(dropURL);   // oldest first
+  return u;
 }
 
 
@@ -400,9 +413,10 @@ async function start() {
   navInit();
   try { await loadLocal(); }
   catch (e) {
-    $("#app").innerHTML = `<div class="wrap"><div class="empty"><h2>This phone's storage didn't open</h2><p>${esc(e.message)}. Close the app all the way and open it again.</p></div></div>`;
+    $("#app").innerHTML = `<div class="wrap"><div class="empty"><h2>The app didn't open right</h2><p>${esc(e.message)}. Close the app all the way and open it again.</p></div></div>`;
     return;
   }
+  DB.purgeSaved().catch(() => { /* nothing to clear */ });   // photos older versions kept on the phone
   const linkKey = keyFromLink();
   if (linkKey && (!S.setup || S.setup.key !== linkKey)) {
     if (S.setup && S.outbox.length) toast("This phone already has photos waiting under another code. Sign out first to switch.");
@@ -418,7 +432,7 @@ function showSignIn(msg, tried) {
   $("#app").innerHTML = `
     <div class="signin">
       <h1>Job Photos</h1>
-      <p>Ellsworth &amp; Son Excavating. Type the code from your link to set up this phone. It needs signal this one time; after that the app works with no service.</p>
+      <p>Ellsworth &amp; Son Excavating. Type the code from your link to set up this phone. Photos are kept in the cloud, not on your phone.</p>
       <form id="codeForm" autocomplete="off">
         <label class="sr" for="codeIn">Your code</label>
         <input id="codeIn" class="code-in" maxlength="12" autocapitalize="characters" spellcheck="false" placeholder="CODE" value="${esc(tried || "")}">
@@ -446,10 +460,9 @@ async function signIn(key, fromLink) {
     await loadLocal();
     S.online = true;
     showHome(true);
-    toast("Set up for " + d.me.name + ". Photos download in the background.");
-    prefetchThumbs();
+    toast("Set up for " + d.me.name + ".");
   } catch (e) {
-    const msg = e.offline ? "No signal. Setting up needs service this one time." : e.message;
+    const msg = e.offline ? "No signal. Setting up needs service." : e.message;
     showSignIn(msg, key);
     if (fromLink && e.offline) toast(msg);
   }
@@ -499,7 +512,7 @@ function statusInfo() {
   if (failed && failed === S.outbox.length && !S.processing.length) return { cls: "bad", text: failed + " didn't send. Tap to see why" };
   if (waiting && !S.online) return { cls: "wait", text: "No signal. " + what + " waiting to send" };
   if (waiting) return { cls: "wait", text: what + " waiting to send" };
-  if (!S.online) return { cls: "", text: "No signal. Showing what's on this phone" };
+  if (!S.online) return { cls: "", text: "No signal. Photos show with service" };
   if (S.syncing) return { cls: "busy", text: "Checking for new photos…" };
   return { cls: "ok", text: S.lastOk ? "Up to date, " + ago(S.lastOk) : "Up to date" };
 }
@@ -635,14 +648,14 @@ function installCard(full) {
   if (!full) {   // the job list gets a short version; the steps open on request
     return `<div class="install" id="installCard">
       <h2>Put Job Photos on your ${what}</h2>
-      <p>Installed, it opens like an app and works with no signal.</p>
+      <p>Installed, it opens like an app. Photos go to the cloud, not your ${what}'s storage.</p>
       <div class="acts">${S.installEvt ? `<button class="btn tape small" type="button" data-install>Install</button>` : `<button class="btn tape small" type="button" data-how>Show me how</button>`}
         <button class="btn quiet small" type="button" data-tipdone>Hide this</button></div>
     </div>`;
   }
   return `<div class="install" id="installCard">
     <h2>Put Job Photos on your ${what}</h2>
-    <p>Installed, it opens like any app and works with no signal. Photos you take wait on the ${what} and send when there's service.</p>
+    <p>Installed, it opens like any app. Photos go straight to the cloud and don't stay on your ${what}. With no signal, a new photo waits only until there's service, then it's sent and cleared off.</p>
     ${installSteps()}
     ${S.installEvt ? `<div class="acts"><button class="btn tape small" type="button" data-install>Install</button></div>` : ""}
   </div>`;
@@ -672,7 +685,7 @@ window.addEventListener("beforeinstallprompt", e => {
 });
 window.addEventListener("appinstalled", () => { S.installEvt = null; ls.set("tipDone", "1"); });
 
-// ================================================================ menu, photo size, people, space
+// ================================================================ menu, photo size, people
 function menuSheet() {
   const owner = isOwner();
   const el = openSheet(`
@@ -684,7 +697,6 @@ function menuSheet() {
       ${owner && !isTouch ? `<li><button data-a="import">${icon("upload")}Load a folder of job photos from this computer</button></li>` : ""}
       ${owner && S.data.folder ? `<li><a href="${esc(S.data.folder)}" target="_blank" rel="noopener">${icon("folder")}Open the photos folder in Google Drive</a></li>` : ""}
       ${standalone() ? "" : `<li><button data-a="install">${icon("phone")}Put the app on your home screen</button></li>`}
-      <li><button data-a="space">${icon("down")}Space on this ${isTouch ? "phone" : "computer"}<span class="hint" id="spaceHint"></span></button></li>
       <li><button data-a="out">${icon("out")}Sign out on this ${isTouch ? "phone" : "computer"}</button></li>
     </ul>
     <p class="muted" style="margin-top:12px">Job Photos ${esc(VERSION)}</p>`);
@@ -695,13 +707,8 @@ function menuSheet() {
     if (a === "people") { if (!S.online) needsSignal("People"); peopleSheet(); }
     if (a === "import") importSheet();
     if (a === "install") { closeSheet(true); installSheet(); }
-    if (a === "space") spaceSheet();
     if (a === "out") { closeSheet(true); signOut(); }
   });
-  storageUse().then(t => { const h = $("#spaceHint"); if (h && t) h.textContent = t; });
-}
-async function storageUse() {
-  try { const e = await navigator.storage.estimate(); return e && e.usage ? Math.round(e.usage / 1048576) + " MB used" : ""; } catch (e) { return ""; }
 }
 function sizeSheet() {
   const el = openSheet(`
@@ -714,23 +721,6 @@ function sizeSheet() {
     S.size = b.dataset.s; ls.set("size", S.size);
     closeSheet(); toast(S.size === "full" ? "Photos will be sent full size." : "Photos will be sent at standard size.");
   });
-}
-
-async function spaceSheet() {
-  const keys = await DB.bkeys().catch(() => []);
-  const views = keys.filter(k => String(k).startsWith("v:")).length, thumbs = keys.filter(k => String(k).startsWith("t:")).length;
-  const used = await storageUse();
-  const el = openSheet(`
-    <h2>Space on this ${isTouch ? "phone" : "computer"}</h2>
-    <div class="stats"><div><b>${thumbs}</b><span>small photos for the lists</span></div><div><b>${views}</b><span>photos saved for viewing with no signal</span></div></div>
-    <p class="muted">${used ? esc(used) + " in all. " : ""}Photos waiting to send are never removed here.</p>
-    <div class="acts"><button class="btn line" data-x>Close</button><button class="btn bad" id="freeYes" ${views ? "" : "disabled"}>Remove saved photos</button></div>`);
-  $("[data-x]", el).onclick = () => closeSheet();
-  $("#freeYes", el).onclick = async () => {
-    const vk = keys.filter(k => String(k).startsWith("v:"));
-    try { await DB.bdel(vk); vk.forEach(dropURL); closeSheet(true); toast("Saved photos removed. They'll download again when you open them with signal."); }
-    catch (e) { toast(e.message); }
-  };
 }
 
 async function peopleSheet() {
@@ -794,15 +784,15 @@ function sendingSheet() {
     const what = o.t === "job" ? "New job: " + o.name : o.t === "photo" ? "Photo for " + (job ? job.name : "a job") : "Note on a photo";
     return `<div class="qrow">
       <span class="qt" ${o.t === "photo" ? `data-key="q:${esc(o.id)}:t"` : ""}></span>
-      <div class="qx"><b>${esc(what)}</b><span>${o.failed ? `<span class="why">${esc(o.err || "The sheet didn't take it.")}</span>` : "Saved on this phone " + esc(ago(o.at || Date.now()))}</span></div>
+      <div class="qx"><b>${esc(what)}</b><span>${o.failed ? `<span class="why">${esc(o.err || "The sheet didn't take it.")}</span>` : "Waiting since " + esc(ago(o.at || Date.now()))}</span></div>
       ${o.failed ? `<button class="btn small quiet" data-drop="${esc(o.id)}">Remove</button>` : ""}
     </div>`;
   }).join("");
   const el = openSheet(`
     <h2>Sending</h2>
     <p class="muted">${ops.length
-      ? (S.online ? "These go to the sheet one at a time." : "No signal right now. These stay on this phone and go on their own when there's service" + (isIOS() ? " and the app is open." : "."))
-      : "Everything on this phone is in the sheet."}${S.lastOk ? " Last good trip " + esc(ago(S.lastOk)) + "." : ""}</p>
+      ? (S.online ? "These go to the cloud one at a time, then they're cleared off this phone." : "No signal right now. These wait on this phone only until there's service" + (isIOS() ? " and the app is open" : "") + ", then they're sent and cleared off.")
+      : "Everything's in the cloud. Nothing is waiting on this phone."}${S.lastOk ? " Last good trip " + esc(ago(S.lastOk)) + "." : ""}</p>
     ${rows ? `<div>${rows}</div>` : ""}
     <div class="acts" style="margin-top:14px"><button class="btn line" data-x>Close</button>
       <button class="btn tape" id="sendNow">${failedOps().length ? "Try again" : "Send now"}</button></div>`);
@@ -826,7 +816,7 @@ function sendingSheet() {
 
 
 
-// ================================================================ thumbnails: from the phone first, the sheet if missing
+// ================================================================ thumbnails: from the cloud, held in memory while the app is open
 const TQ = { want: new Set(), busy: 0 };
 function setBg(el, u) {
   el.style.backgroundImage = `url("${u}")`;
@@ -849,23 +839,14 @@ function pumpThumbs() {
     const batch = Array.from(TQ.want).slice(0, 20);
     batch.forEach(id => TQ.want.delete(id));
     TQ.busy++;
-    DB.call("thumbs", { ids: batch }, 60000).then(async map => {
+    DB.call("thumbs", { ids: batch }, 60000).then(map => {
       for (const id of Object.keys(map || {})) {
-        const blob = DB.b64Blob(map[id], "image/jpeg");
-        try { await DB.bput("t:" + id, blob); } catch (e) { /* phone storage full: still show it now */ }
-        const u = URL.createObjectURL(blob);
-        dropURL("t:" + id);
-        S.urls.set("t:" + id, u);
+        const u = memPut("t:" + id, DB.b64Blob(map[id], "image/jpeg"));
         $$(`[data-key="t:${CSS.escape(id)}"]`).forEach(el => setBg(el, u));
       }
     }).catch(e => { if (e && e.offline) { S.online = false; batch.forEach(id => TQ.want.add(id)); renderStatus(); } })
       .finally(() => { TQ.busy--; pumpThumbs(); });
   }
-}
-async function prefetchThumbs() {
-  const have = new Set(await DB.bkeys().catch(() => []));
-  list(S.data.photos).forEach(p => { const id = p.t || p.f; if (id && !have.has("t:" + id)) TQ.want.add(id); });
-  pumpThumbs();
 }
 
 // ================================================================ job page
@@ -931,7 +912,7 @@ function renderJob() {
       </div>
       <label class="sr" for="noteIn">Note for the next photos</label>
       <input class="note-in" id="noteIn" maxlength="300" placeholder="Note for the next photos (optional)" value="${esc(S.note || "")}">
-      <div id="saveLine"></div>
+      ${S.online ? "" : `<p class="offnote">No signal. Photos live in the cloud, so they show when you're back in service. You can still take photos: they send on their own.</p>`}
       <div id="photos"></div>
       <div style="height:130px"></div>
     </div>`;
@@ -942,47 +923,7 @@ function renderJob() {
   $("#noteIn").addEventListener("input", e => { S.note = e.target.value; });
   if (owner) $("#editJob").onclick = () => (S.online ? editJobSheet() : needsSignal("Editing a job"));
   renderPhotos();
-  renderSaveLine(j);
   renderBar();
-}
-
-async function renderSaveLine(j) {
-  const box = $("#saveLine");
-  if (!box) return;
-  const sent = list(S.data.photos).filter(p => p.job === j.id);
-  if (!sent.length) { box.innerHTML = ""; return; }
-  const have = new Set(await DB.bkeys().catch(() => []));
-  const saved = sent.filter(p => have.has("v:" + p.id)).length;
-  if (!$("#saveLine") || S.jobId !== j.id) return;
-  box.innerHTML = saved >= sent.length
-    ? `<div class="saveline">${icon("check")}<span>All ${sent.length} photos are saved on this ${isTouch ? "phone" : "computer"} for no signal.</span></div>`
-    : `<div class="saveline"><span>${saved} of ${sent.length} photos saved for no signal.</span><button class="btn small line" id="saveAll">${icon("down")}Save the rest</button></div>`;
-  const b = $("#saveAll");
-  if (b) b.onclick = () => saveJobOffline(j, sent.filter(p => !have.has("v:" + p.id)));
-}
-async function saveJobOffline(j, todo) {
-  if (!S.online) { needsSignal("Saving photos"); return; }
-  const b = $("#saveAll");
-  let n = 0, stop = false;
-  const next = async () => {
-    while (todo.length && !stop) {
-      const p = todo.shift();
-      try {
-        const r = await DB.call("view", { id: p.id, full: false }, 60000);
-        await DB.bput("v:" + p.id, DB.b64Blob(r.data, r.mime));
-        n++;
-        if (b && b.isConnected) b.textContent = "Saving " + n + "…";
-      } catch (e) {
-        if (e && e.offline) { stop = true; S.online = false; }
-        if (e && e.name === "QuotaExceededError") { stop = true; toast("This phone is out of space for saved photos."); }
-      }
-    }
-  };
-  if (b) b.disabled = true;
-  await Promise.all([next(), next()]);
-  if (stop && !S.online) toast("Signal dropped. " + n + " photos saved so far.");
-  else toast(n + " photos saved for no signal.");
-  if (S.view === "job" && S.jobId === j.id) renderSaveLine(j);
 }
 
 function renderPhotos() {
@@ -990,7 +931,7 @@ function renderPhotos() {
   if (!box || S.view !== "job") return;
   const items = jobItems(S.jobId);
   if (!items.length) {
-    box.innerHTML = `<div class="empty"><h2>No photos yet</h2><p>Take one, or add some from your ${isTouch ? "phone" : "computer"}. It works with no signal too.</p></div>`;
+    box.innerHTML = `<div class="empty"><h2>No photos yet</h2><p>Take one, or add some from your ${isTouch ? "phone" : "computer"}. They go to the cloud, not your ${isTouch ? "phone's" : "computer's"} storage.</p></div>`;
     return;
   }
   const groups = new Map();
@@ -1060,7 +1001,7 @@ function openViewer(id) {
   V.el.setAttribute("aria-label", "Photo");
   V.el.innerHTML = `
     <div class="vtop"><button class="vbtn" data-v="close" aria-label="Close">${icon("close")}</button><div class="grow num" id="vCount"></div><span style="width:46px"></span></div>
-    <div class="stage" id="vStage"><img id="vImg" alt=""><span class="vload hidden" id="vLoad"><span class="spin"></span></span>
+    <div class="stage" id="vStage"><img id="vImg" alt=""><span class="vload hidden" id="vLoad"><span class="spin"></span></span><p class="vmsg hidden" id="vMsg"></p>
       <button class="nav prev" data-v="prev" aria-label="Previous photo">${icon("back")}</button><button class="nav next" data-v="next" aria-label="Next photo">${icon("next")}</button></div>
     <div class="vinfo"><div class="meta" id="vMeta"></div><div class="vcap" id="vCap"></div><div class="vacts" id="vActs"></div></div>`;
   document.body.append(V.el);
@@ -1086,6 +1027,7 @@ function closeViewer() {
   if (!V.open) return;
   V.open = false;
   V.el.remove(); V.el = null;
+  dropURL("f:");                                  // a full-size photo is only held while it's on screen
   document.body.style.overflow = "";
   document.body.classList.remove("viewing");
   closeSheet(true);
@@ -1109,7 +1051,9 @@ async function showPhoto(full) {
   const img = $("#vImg", V.el), req = ++V.req;
   const small = await blobURL(x.key);
   if (req !== V.req || !V.el) return;
-  if (!full) img.src = small || "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+  const msg = $("#vMsg", V.el);
+  msg.classList.add("hidden");
+  if (!full) img.src = small || "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
   $("#vCount", V.el).textContent = (V.i + 1) + " of " + V.list.length;
   $("#vMeta", V.el).innerHTML = "Taken " + esc(fmtFull(x.t)) + (x.kind === "wait"
     ? "<br>" + (x.op.failed ? "Didn't send: " + esc(x.op.err || "") : "Waiting on this phone to send")
@@ -1131,24 +1075,19 @@ async function showPhoto(full) {
     if (req === V.req && V.el && u) img.src = u;
     return;
   }
-  if (!full) {
-    const saved = await blobURL("v:" + x.id);
-    if (req !== V.req || !V.el) return;
-    if (saved) { img.src = saved; return; }
-  }
+  if (!full && S.urls.has("v:" + x.id)) { img.src = S.urls.get("v:" + x.id); return; }   // opened a moment ago
   if (!S.online) {
-    if (!V.warned) { V.warned = true; toast(full ? "Full size needs signal." : "No signal: showing the small copy. Use “Save the rest” on the job to keep big copies on the phone."); }
+    if (!small) { msg.textContent = "No signal. Photos are kept in the cloud, so this one shows when you're back in service."; msg.classList.remove("hidden"); }
+    else if (!V.warned) { V.warned = true; toast("No signal: showing the small copy."); }
     return;
   }
   $("#vLoad", V.el).classList.remove("hidden");
   try {
     const r = await DB.call("view", { id: x.id, full: !!full }, 90000);
     const blob = DB.b64Blob(r.data, r.mime);
-    if (!full) { try { await DB.bput("v:" + x.id, blob); } catch (e) { /* no room: show it anyway */ } }
     if (req !== V.req || !V.el) return;
-    const u = URL.createObjectURL(blob);
-    if (!full) { dropURL("v:" + x.id); S.urls.set("v:" + x.id, u); }
-    img.src = u;
+    if (full) { dropURL("f:"); S.urls.set("f:", URL.createObjectURL(blob)); img.src = S.urls.get("f:"); }
+    else img.src = memPut("v:" + x.id, blob);
   } catch (err) {
     if (err && err.offline) S.online = false;
     if (req === V.req && V.el) toast(err.offline ? "No signal: showing the small copy." : err.message);
@@ -1214,7 +1153,7 @@ function deletePhoto() {
     try {
       await DB.call("deletePhoto", { id: x.id }, 30000);
       await DB.update("data", dd => { dd.photos = list(dd.photos).filter(p => p.id !== x.id); return dd; });
-      await DB.bdel(["v:" + x.id]);
+      dropURL("v:" + x.id);
       await loadLocal();
       closeSheet(true); afterPhotoGone(); toast("Photo deleted.");
     } catch (err) { toast(err.offline ? "Deleting needs signal." : err.message); }
@@ -1288,7 +1227,7 @@ function bindGestures(stage) {
 
 
 
-// ================================================================ taking and adding photos: saved on the phone first, sent after
+// ================================================================ taking and adding photos: held on the phone only until they're sent
 function pick(sel) {
   if (!S.jobId) return;
   S.pickJob = S.jobId;
@@ -1318,7 +1257,6 @@ function addFiles(files, jobId, caption, size) {
   if (caption && S.view === "job" && S.jobId === jobId) { S.note = ""; const n = $("#noteIn"); if (n) n.value = ""; }
   if (S.view === "job") renderPhotos();
   renderStatus();
-  requestPersist();
   for (let i = PQ.running; i < (isTouch ? 1 : 2); i++) prepWorker();
 }
 async function prepWorker() {
@@ -1376,7 +1314,6 @@ async function kickSync() {
   else if (r && r.error && !r.offline) S.lastErr = r.error;
   try { await loadLocal(); } catch (e) { /* storage hiccup: next round */ }
   rerender();
-  if (r && r.pulled) prefetchThumbs();
   if (S.again) { S.again = false; setTimeout(kickSync, 300); }
   else if (S.outbox.some(o => !o.failed)) {
     registerBgSync();
@@ -1432,10 +1369,10 @@ function renderBar() {
       l1 = `<span class="spin"></span><span class="grow">Sending ${Math.min(S.batch.done + 1, total)} of ${total}</span>`;
       l2 = isAndroid() ? "You can keep working. With signal it finishes even if you close the app." : "Keep the app open until it says sent.";
     } else if (S.processing.length) {
-      l1 = `<span class="spin"></span><span class="grow">Saving ${S.processing.length} photo${S.processing.length === 1 ? "" : "s"} on this phone</span>`;
+      l1 = `<span class="spin"></span><span class="grow">Getting ${S.processing.length} photo${S.processing.length === 1 ? "" : "s"} ready to send</span>`;
     } else {
       l1 = `<span class="ic" style="color:var(--warn)">${icon("clock")}</span><span class="grow">${waiting} photo${waiting === 1 ? "" : "s"} waiting for signal</span><button class="btn small line" id="barWhy">Details</button>`;
-      l2 = "They're saved on this phone and send on their own when there's service" + (isIOS() ? " and the app is open." : ".");
+      l2 = "They wait on this phone only until there's service" + (isIOS() ? " and the app is open" : "") + ", then they're sent and cleared off.";
     }
   }
   bar.innerHTML = `<div class="in"><div class="l1">${l1}</div>${l2 ? `<div class="l2">${l2}</div>` : ""}<div class="bar"><i style="width:${pct}%"></i></div></div>`;
@@ -1446,15 +1383,6 @@ function renderBar() {
 function registerBgSync() {
   if (!("serviceWorker" in navigator)) return;
   navigator.serviceWorker.ready.then(reg => (reg.sync && reg.sync.register ? reg.sync.register("jp-send") : null)).catch(() => { /* not on this phone */ });
-}
-let persistAsked = false;
-function requestPersist() {
-  if (persistAsked) return;
-  persistAsked = true;
-  try {
-    const sm = navigator.storage;
-    if (sm && sm.persist) (sm.persisted ? sm.persisted() : Promise.resolve(false)).then(p => p || sm.persist()).catch(() => { /* best effort */ });
-  } catch (e) { /* best effort */ }
 }
 
 window.addEventListener("online", () => { S.online = true; renderStatus(); kickSync(); pumpThumbs(); });

@@ -1,7 +1,7 @@
 {
   "name": "Ellsworth Job Photos",
   "short_name": "Job Photos",
-  "description": "Job site photos. Works with no signal.",
+  "description": "Job site photos, kept in the cloud.",
   "id": "./",
   "start_url": "./",
   "scope": "./",

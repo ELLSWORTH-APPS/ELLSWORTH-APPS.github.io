@@ -7,9 +7,9 @@
             outbox [op, ...]                    things done on this phone that the sheet doesn't have yet
             jobmap { tmp id: real id }          jobs started with no signal, once the sheet has them
             lastOk                              time of the last good trip to the sheet
-     blobs  "t:<file id>"     a photo's thumbnail
-            "v:<photo id>"    a photo sized for looking at (about 1600 px)
-            "q:<op id>:d|v|t" a waiting photo: the photo, its viewing copy, its thumbnail */
+     blobs  "q:<op id>:d|v|t" a photo waiting to send: the photo, its viewing copy, its thumbnail.
+                              Deleted the moment it reaches the cloud. Photos are never kept on the phone
+                              otherwise: the app shows them from the cloud and holds them in memory only. */
 (function (root) {
   "use strict";
   const DB_NAME = "job-photos";
@@ -104,6 +104,13 @@
   const bput = (key, blob) => run([BL], "readwrite", t => { t.objectStore(BL).put(blob, key); return true; });
   const bdel = keys => run([BL], "readwrite", t => { const s = t.objectStore(BL); keys.forEach(k => s.delete(k)); return true; });
   const bkeys = () => run([BL], "readonly", t => { const q = t.objectStore(BL).getAllKeys(); return () => list(q.result); });
+  // Older versions kept copies of photos on the phone ("t:" small, "v:" big). Photos live in the cloud now,
+  // so those are cleared out. Only photos still waiting to send ("q:") are ever kept, and only until they go.
+  async function purgeSaved() {
+    const old = (await bkeys()).filter(k => /^[tv]:/.test(String(k)));
+    if (old.length) await bdel(old);
+    return old.length;
+  }
   function clearAll() {
     return run([KV, BL], "readwrite", t => { t.objectStore(KV).clear(); t.objectStore(BL).clear(); return true; });
   }
@@ -113,9 +120,32 @@
     return run([KV, BL], "readwrite", t => {
       const b = t.objectStore(BL), s = t.objectStore(KV);
       Object.keys(files || {}).forEach(k => { if (files[k]) b.put(files[k], k); });
-      const q = s.get("outbox");
-      q.onsuccess = () => s.put(list(q.result).concat([op]), "outbox");
+      // A job started on this phone may have reached the sheet while this photo was being got ready:
+      // file it under the job's real number, or it would wait for a job that's already been sent.
+      const m = s.get("jobmap");
+      m.onsuccess = () => {
+        const real = op.job && (m.result || {})[op.job];
+        if (real) op.job = real;
+        const q = s.get("outbox");
+        q.onsuccess = () => s.put(list(q.result).concat([op]), "outbox");
+      };
       return op;
+    });
+  }
+  // Mends anything already filed under a started job's temporary number after that job was sent.
+  function fixJobNumbers() {
+    return run([KV], "readwrite", t => {
+      const s = t.objectStore(KV);
+      const m = s.get("jobmap");
+      m.onsuccess = () => {
+        const map = m.result || {};
+        const q = s.get("outbox");
+        q.onsuccess = () => {
+          const ob = list(q.result);
+          if (ob.some(o => o && map[o.job])) s.put(ob.map(o => (o && map[o.job] ? Object.assign({}, o, { job: map[o.job] }) : o)), "outbox");
+        };
+      };
+      return true;
     });
   }
   function changeOp(id, fn) {
@@ -231,9 +261,7 @@
     const rec = await call("upload", args, 180000);
     await run([KV, BL], "readwrite", t => {
       const b = t.objectStore(BL), s = t.objectStore(KV);
-      if (files.t && rec.t) b.put(files.t, "t:" + rec.t);                     // so it shows with no signal
-      if (rec.id) b.put(files.v || files.d, "v:" + rec.id);
-      ["d", "v", "t"].forEach(x => b.delete("q:" + id + ":" + x));
+      ["d", "v", "t"].forEach(x => b.delete("q:" + id + ":" + x));            // it's in the cloud now: nothing stays on the phone
       const q1 = s.get("outbox");
       q1.onsuccess = () => s.put(list(q1.result).filter(o => o && o.id !== id), "outbox");
       const q2 = s.get("data");
@@ -275,6 +303,7 @@
     const width = Math.max(1, opts.parallel || 1);
     let sent = 0;
     for (let round = 0; round < 3000; round++) {
+      await fixJobNumbers();
       const ready = readyOps(await get("outbox"));
       if (!ready.length) return { ok: true, sent };
       const batch = ready[0].t === "photo" ? ready.filter(o => o.t === "photo").slice(0, width) : [ready[0]];
@@ -327,7 +356,7 @@
   }
 
   root.JPStore = {
-    open, reset, get, set, del, update, bget, bput, bdel, bkeys, clearAll, queue, changeOp, removeOp,
+    open, reset, get, set, del, update, bget, bput, bdel, bkeys, purgeSaved, clearAll, queue, changeOp, removeOp,
     post, call, blobB64, b64Blob, pushAll, pull, syncAll, withLock, list
   };
 })(typeof self !== "undefined" ? self : globalThis);
