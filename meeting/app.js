@@ -1,16 +1,13 @@
-/* Morning Meeting. Records the morning meeting, sends the recording to Google's AI together with the names lists,
-   and shows the day's job sheet. Recordings, sheets, names and the AI key are kept on this phone only.
+/* Morning Meeting. Records the morning meeting, turns it into words on the phone with a built-in speech engine,
+   and has Claude turn those words and the names lists into the day's job sheet.
+   Recordings, sheets, names and the Claude key are kept on this phone only; only the words go to Claude.
    Nothing is stored on the website the app comes from. */
 (() => {
 "use strict";
 
 const VERSION = self.MM_VERSION || "dev";
 const MAX_REC_MS = 35 * 60 * 1000;        // a forgotten recording stops itself
-const INLINE_MAX = 13.5 * 1024 * 1024;    // Google takes 20 MB per request, and sending adds a third
-const MAX_AI_SECS = 20 * 60;              // when a long recording has to be shrunk, only its start goes to the AI
-const API = "https://generativelanguage.googleapis.com/v1beta";
-const KEY_URL = "https://aistudio.google.com/apikey";
-const DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+const MAX_AI_SECS = 20 * 60;              // only the first 20 minutes of a recording are listened to
 
 /* ---------- small helpers ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -270,126 +267,107 @@ function updateRec() {
   }
 }
 
-/* ---------- getting a recording ready for Google's AI ---------- */
-const BY_EXT = { m4a: "audio/m4a", mp4: "audio/m4a", mp3: "audio/mp3", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg", webm: "audio/webm", weba: "audio/webm", flac: "audio/flac", aac: "audio/aac", aif: "audio/aiff", aiff: "audio/aiff" };
-const BY_TYPE = { "audio/webm": "audio/webm", "video/webm": "audio/webm", "audio/ogg": "audio/ogg", "audio/mpeg": "audio/mp3", "audio/mp3": "audio/mp3", "audio/wav": "audio/wav", "audio/x-wav": "audio/wav", "audio/wave": "audio/wav", "audio/flac": "audio/flac", "audio/x-flac": "audio/flac", "audio/aac": "audio/aac", "audio/mp4": "audio/m4a", "audio/x-m4a": "audio/m4a", "audio/m4a": "audio/m4a", "video/mp4": "audio/m4a", "audio/aiff": "audio/aiff", "audio/x-aiff": "audio/aiff" };
-function apiMime(blob, name) {
-  const ext = (/\.([a-z0-9]{2,5})$/i.exec(name || "") || [])[1];
-  if (ext && BY_EXT[ext.toLowerCase()]) return BY_EXT[ext.toLowerCase()];
-  return BY_TYPE[(blob.type || "").split(";")[0].toLowerCase()] || null;
+/* ---------- the speech engine on the phone ---------- */
+const SPEECH_MB = 137;
+const asr = { w: null, ready: false, loading: null, jobs: new Map(), seq: 0, prog: null, onProg: null, threads: 0, err: "" };
+function asrWorker() {
+  if (asr.w) return asr.w;
+  const w = asr.w = new Worker("asr-worker.js");
+  w.onmessage = (ev) => {
+    const m = ev.data || {};
+    if (m.t === "progress") { asr.prog = m; if (asr.onProg) asr.onProg(m); updateSpeech(); }
+    else if (m.t === "ready") { asr.ready = true; state.speechKept = true; asr.threads = m.threads; asr.err = ""; S.put("kv", true, "speech-ready").catch(() => {}); if (asr.loading) { asr.loading.res(); asr.loading = null; } if (state.route.view === "setup") render(); }
+    else if (m.t === "result" || m.t === "error") {
+      const job = asr.jobs.get(m.id);
+      if (m.t === "error" && !job && asr.loading) { asr.loading.rej(m); asr.loading = null; }
+      if (job) { asr.jobs.delete(m.id); m.t === "result" ? job.res(m.lines) : job.rej({ code: m.code === "offline" ? "speech_offline" : m.code === "download" ? "speech_download" : "speech", message: m.message }); }
+      if (m.t === "error") { asr.err = m.code; if (state.route.view === "setup") render(); }
+    }
+  };
+  w.onerror = () => { const jobs = [...asr.jobs.values()]; asr.jobs.clear(); jobs.forEach((j) => j.rej({ code: "speech" })); try { w.terminate(); } catch (e) { /* fine */ } asr.w = null; };
+  return w;
 }
-function toBase64(blob) {
+function loadSpeech() {
+  if (asr.ready) return Promise.resolve();
+  if (!asr.loading) {
+    let res, rej; const p = new Promise((a, b) => { res = a; rej = b; });
+    asr.loading = { p, res, rej };
+    asrWorker().postMessage({ t: "load" });
+    p.catch(() => { /* shown in Setup */ });
+  }
+  return asr.loading.p;
+}
+function transcribe(pcm, maxSecs, onProg, signal) {
   return new Promise((res, rej) => {
-    const fr = new FileReader();
-    fr.onload = () => { const s = String(fr.result); res(s.slice(s.indexOf(",") + 1)); };
-    fr.onerror = () => rej({ code: "decode" });
-    fr.readAsDataURL(blob);
+    const id = ++asr.seq;
+    asr.jobs.set(id, { res, rej });
+    asr.onProg = onProg;
+    if (signal) signal.addEventListener("abort", () => {   // the engine can't be paused mid-piece, so it's restarted
+      if (!asr.jobs.has(id)) return;
+      asr.jobs.delete(id); try { asr.w.terminate(); } catch (e) { /* fine */ } asr.w = null; asr.ready = false; asr.loading = null;
+      rej({ code: "cancelled" });
+    });
+    asrWorker().postMessage({ t: "run", id, pcm, maxSecs }, [pcm.buffer]);
   });
 }
-let lameLoading = null;
-function loadLame() {
-  if (window.lamejs) return Promise.resolve();
-  return lameLoading || (lameLoading = new Promise((res, rej) => {
-    const s = document.createElement("script"); s.src = "vendor/lame.min.js";
-    s.onload = () => (window.lamejs ? res() : rej({ code: "decode" }));
-    s.onerror = () => { lameLoading = null; rej({ code: "decode" }); };
-    document.head.appendChild(s);
-  }));
+function updateSpeech() {
+  const el = $("#speech-line"); if (!el || !asr.prog) return;
+  const m = asr.prog;
+  el.textContent = m.stage === "download" ? "Downloading the speech engine: " + Math.round(m.done / 1048576) + " of " + Math.round(m.total / 1048576) + " MB"
+    : m.stage === "start" ? "Starting the speech engine" : "";
 }
-// Shrinks a recording to a small MP3 (16 kHz, one channel), which Google's AI always accepts. Only the first maxSecs are kept.
-async function toMp3(blob, maxSecs, signal) {
+// Turns any recording into 16 kHz mono sound for the speech engine.
+async function toPcm(blob, maxSecs) {
   try {
-    await loadLame();
     const AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     const ctx = new AC(1, 16000, 16000);
     const bytes = await blob.arrayBuffer();
     const audio = await new Promise((res, rej) => { const p = ctx.decodeAudioData(bytes, res, rej); if (p && p.catch) p.catch(rej); });
-    const rate = audio.sampleRate, n = Math.min(audio.length, Math.floor(maxSecs * rate));
-    const chans = []; for (let c = 0; c < audio.numberOfChannels; c++) chans.push(audio.getChannelData(c));
-    const enc = new window.lamejs.Mp3Encoder(1, rate, 48), out = [], B = 1152 * 40, pcm = new Int16Array(B);
-    for (let i = 0, k = 0; i < n; i += B, k++) {
-      if (signal && signal.aborted) throw { code: "cancelled" };
-      const len = Math.min(B, n - i);
-      for (let j = 0; j < len; j++) {
-        let v = 0; for (let c = 0; c < chans.length; c++) v += chans[c][i + j];
-        v /= chans.length; v = v < -1 ? -1 : v > 1 ? 1 : v;
-        pcm[j] = v < 0 ? v * 32768 : v * 32767;
-      }
-      const part = enc.encodeBuffer(len === B ? pcm : pcm.subarray(0, len));
-      if (part.length) out.push(new Uint8Array(part));
-      if (k % 6 === 5) await sleep(0);
-    }
-    const tail = enc.flush(); if (tail.length) out.push(new Uint8Array(tail));
-    return new Blob(out, { type: "audio/mp3" });
-  } catch (e) { throw e && e.code ? e : { code: "decode" }; }
+    const len = Math.min(audio.duration, maxSecs);
+    const off = new AC(1, Math.max(1, Math.ceil(len * 16000)), 16000);
+    const src = off.createBufferSource(); src.buffer = audio; src.connect(off.destination); src.start();
+    return (await off.startRendering()).getChannelData(0).slice();
+  } catch (e) { throw { code: "decode" }; }
 }
+const linesText = (lines) => lines.map((l) => "[" + clock(l.at * 1000) + "] " + l.text).join("\n");
 
-/* ---------- talking to Google's AI ---------- */
-const SAFETY = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"].map((c) => ({ category: c, threshold: "BLOCK_NONE" }));
-const STR = { type: "STRING" }, LIST = { type: "ARRAY", items: { type: "STRING" } };
-const SHEET_SCHEMA = { type: "OBJECT", properties: {
-  headline: STR,
-  assignments: { type: "ARRAY", items: { type: "OBJECT", properties: {
-    who: LIST, kind: { type: "STRING", format: "enum", enum: ["crew", "truck", "move", "shop", "other"] },
-    steps: { type: "ARRAY", items: { type: "OBJECT", properties: { where: STR, what: STR, how: LIST }, required: ["where", "what", "how"] } },
-    bring: LIST, notes: LIST, unsure: LIST }, required: ["who", "kind", "steps", "bring", "notes", "unsure"] } },
-  everyone: LIST, unsure: LIST }, required: ["headline", "assignments", "everyone", "unsure"] };
-const BUILD_SCHEMA = { type: "OBJECT", properties: { heard: STR, sheet: SHEET_SCHEMA }, required: ["heard", "sheet"] };
-const TYPED_SCHEMA = { type: "OBJECT", properties: { sheet: SHEET_SCHEMA }, required: ["sheet"] };
-const FIX_SCHEMA = { type: "OBJECT", properties: { sheet: SHEET_SCHEMA, learn: { type: "OBJECT", properties: { people: LIST, places: LIST, gear: LIST }, required: ["people", "places", "gear"] } }, required: ["sheet", "learn"] };
-
-async function gFetch(path, body, signal) {
+/* ---------- talking to Claude ---------- */
+const API = "https://api.anthropic.com/v1";
+const KEY_URL = "https://console.anthropic.com/settings/keys";
+const BILLING_URL = "https://console.anthropic.com/settings/billing";
+const DEFAULT_MODELS = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-sonnet-5", "claude-haiku-5-5"];
+async function cFetch(path, body, signal, key) {
   let res;
   try {
     res = await fetch(API + path, { method: body ? "POST" : "GET", cache: "no-store", signal,
-      headers: body ? { "x-goog-api-key": state.key, "Content-Type": "application/json" } : { "x-goog-api-key": state.key }, body: body || undefined });
+      headers: Object.assign({ "x-api-key": key || state.key, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }, body ? { "content-type": "application/json" } : {}),
+      body: body || undefined });
   } catch (e) { throw { code: signal && signal.aborted ? "cancelled" : navigator.onLine === false ? "offline" : "unreachable" }; }
   let data = null; try { data = await res.json(); } catch (e) { /* no body */ }
-  if (!res.ok) { const er = (data && data.error) || {}; throw { code: "http", status: res.status, message: String(er.message || "").slice(0, 300) }; }
+  if (!res.ok) { const er = (data && data.error) || {}; throw { code: "http", status: res.status, type: er.type || "", message: String(er.message || "").slice(0, 300) }; }
   return data || {};
 }
-function sortErr(e) {     // what kind of "no" this was
+function sortErr(e) {
   if (!e || e.code !== "http") return (e && e.code) || "failed";
-  const m = (e.message || "").toLowerCase(), s = e.status;
-  if ((s === 400 && /api key|api_key/.test(m)) || s === 401) return "badkey";
-  if (s === 403) return /key|credential|unregistered|permission/.test(m) ? "badkey" : "denied";
-  if (s === 404 || (s === 400 && /model/.test(m) && /not found|not supported|unknown|does not exist|unsupported/.test(m))) return "model";
-  if (s === 429) return /limit: 0\b/.test(m) ? "quota0" : "quota";
-  if (s === 413) return "big";
-  if (s >= 500) return "busy";
-  if (s === 400) return "bad400";
-  return "failed";
+  const m = (e.message || "").toLowerCase();
+  if (e.status === 401 || e.type === "authentication_error") return "badkey";
+  if (/credit balance|billing|purchase credits|spend limit|usage limit/.test(m)) return "nocredit";
+  if (e.status === 403 || e.type === "permission_error") return "denied";
+  if (e.status === 404 || e.type === "not_found_error" || (/model/.test(m) && /not found|does not exist|invalid model/.test(m))) return "model";
+  if (e.status === 429 || e.type === "rate_limit_error") return "busy";
+  if (e.status === 529 || e.status >= 500 || e.type === "overloaded_error" || e.type === "api_error") return "busy";
+  if (e.status === 413) return "big";
+  return "rejected";
 }
-function pullText(node) {
-  if (!node || typeof node !== "object") return "";
-  if (Array.isArray(node)) return node.map(pullText).join("");
-  if (node.type === "thought" || node.type === "user_input" || node.role === "user") return "";
-  if (node.type === "text" && typeof node.text === "string") return node.text;
-  let out = ""; for (const k in node) if (node[k] && typeof node[k] === "object") out += pullText(node[k]);
-  return out;
+function rankModels(list) {
+  const ids = (list || []).map((m) => String((m && m.id) || "")).filter((n) => /^claude-/.test(n));
+  const ver = (n) => { const v = /-(\d+)(?:-(\d))?(?:-|$)/.exec(n.replace(/^claude-(sonnet|opus|haiku|fable)/, "")); return v ? +v[1] + (v[2] ? +v[2] / 10 : 0) : 0; };
+  const fam = (n) => (/sonnet/.test(n) ? 0 : /opus/.test(n) ? 1 : /haiku/.test(n) ? 2 : 3);
+  return ids.filter((n) => fam(n) < 3).sort((a, b) => fam(a) - fam(b) || ver(b) - ver(a) || a.length - b.length);
 }
-async function callModel(m, part, prompt, mode, schema, signal) {
-  if (m.gc === false) {      // a model Google only offers through its newer Interactions route
-    const input = []; if (part) input.push({ type: "audio", data: part.inline_data.data, mime_type: part.inline_data.mime_type });
-    input.push({ type: "text", text: prompt });
-    const d = await gFetch("/interactions", JSON.stringify({ model: m.n, input, store: false }), signal);
-    const t = typeof d.output_text === "string" ? d.output_text : pullText(d.steps || d.outputs || []);
-    if (!t.trim()) throw { code: "empty" };
-    return t;
-  }
-  const body = { contents: [{ role: "user", parts: part ? [part, { text: prompt }] : [{ text: prompt }] }] };
-  if (mode !== "plain") {
-    body.safetySettings = SAFETY;
-    body.generationConfig = mode === "schema" && schema ? { responseMimeType: "application/json", responseSchema: schema } : { responseMimeType: "application/json" };
-  }
-  const d = await gFetch("/models/" + encodeURIComponent(m.n) + ":generateContent", JSON.stringify(body), signal);
-  const c = d.candidates && d.candidates[0];
-  const t = c && c.content && Array.isArray(c.content.parts) ? c.content.parts.filter((p) => p && typeof p.text === "string" && !p.thought).map((p) => p.text).join("") : "";
-  if (!t.trim()) {
-    const blocked = (d.promptFeedback && d.promptFeedback.blockReason) || (c && /SAFETY|PROHIBITED|BLOCK|RECITATION/.test(String(c.finishReason || "")));
-    throw { code: blocked ? "blocked" : "empty" };
-  }
-  return t;
+async function listModels(key) {
+  const d = await cFetch("/models?limit=100", null, null, key);
+  return rankModels(d.data || []);
 }
 function parseJson(text) {
   const t = String(text || "").trim();
@@ -401,103 +379,63 @@ function parseJson(text) {
   if (a >= 0 && b > a) { v = tryIt(t.slice(a, b + 1)); if (v !== undefined) return v; }
   throw { code: "badjson" };
 }
-function rankModels(list) {
-  const SKIP = /(image|tts|live|audio|embed|native|omni|transcribe|translate|computer|robot|banana|veo|lyria|imagen|gemma|learnlm|research|customtools|search)/;
-  const out = [];
-  for (const it of list || []) {
-    const n = String((it && it.name) || "").replace(/^models\//, "");
-    if (!/^gemini-/.test(n) || !/flash/.test(n) || SKIP.test(n)) continue;
-    const meth = it.supportedGenerationMethods || it.supported_generation_methods || it.supportedActions || null;
-    const v = /^gemini-(\d+(?:\.\d+)?)/.exec(n);
-    out.push({ n, gc: Array.isArray(meth) && meth.length ? meth.indexOf("generateContent") >= 0 : true, ver: v ? parseFloat(v[1]) : 0,
-      lite: /lite/.test(n) ? 1 : 0, pre: /(preview|exp|latest|-\d{3,}$|\d{2}-\d{2})/.test(n) ? 1 : 0 });
-  }
-  out.sort((a, b) => (Number(b.gc) - Number(a.gc)) || (a.lite - b.lite) || (a.pre - b.pre) || (b.ver - a.ver) || (a.n < b.n ? -1 : 1));
-  return out.map((x) => ({ n: x.n, gc: x.gc }));
-}
-async function listModels() {
-  const out = []; let token = "";
-  for (let i = 0; i < 6; i++) {
-    const d = await gFetch("/models?pageSize=200" + (token ? "&pageToken=" + encodeURIComponent(token) : ""));
-    (d.models || []).forEach((m) => out.push(m));
-    token = d.nextPageToken || ""; if (!token) break;
-  }
-  return out;
-}
-async function refreshModels() {
-  const ranked = rankModels(await listModels());
-  if (ranked.length) { state.models = ranked; await S.put("kv", ranked, "models").catch(() => {}); }
-  return ranked;
-}
-// One request, with every fallback: another model, a shrunk recording, a simpler request.
-async function askGoogle({ audio, prompt, schema, signal, onStep }) {
+async function askClaude({ prompt, signal, onStep }) {
   if (!state.key) throw { code: "nokey" };
-  let models = (state.models.length ? state.models : DEFAULT_MODELS.map((n) => ({ n, gc: true }))).slice();
-  let mi = 0, mode = "schema", useMp3 = false, tries = 0, waited = false, relisted = false, badJson = false;
-  const prep = async () => {
-    if (!audio) return null;
-    let blob = audio.blob, mime = useMp3 ? null : apiMime(blob, audio.name);
-    if (!mime || blob.size > INLINE_MAX) { onStep("Shrinking the recording"); blob = await toMp3(audio.blob, MAX_AI_SECS, signal); mime = "audio/mp3"; useMp3 = true; }
-    if (blob.size > INLINE_MAX) throw { code: "toolong" };
-    onStep("Sending the recording");
-    return { inline_data: { mime_type: mime, data: await toBase64(blob) } };
-  };
-  let part = await prep();
-  for (;;) {
-    if (++tries > 10) throw { code: "failed" };
+  let models = (state.models.length ? state.models : DEFAULT_MODELS).slice(), mi = 0, waited = 0, relisted = false, badJson = false;
+  for (let tries = 0; tries < 10; tries++) {
     if (signal && signal.aborted) throw { code: "cancelled" };
-    const m = models[mi];
-    onStep(audio ? "Google's AI is listening to the meeting" : "Sorting out who's doing what");
+    onStep("Claude is sorting out who's doing what");
+    const model = models[mi];
     try {
-      const text = await callModel(m, part, prompt, mode, schema, signal);
+      const d = await cFetch("/messages", JSON.stringify({ model, max_tokens: 12000,
+        system: "You turn the morning crew meeting of an excavating company into a job sheet. Reply with JSON only, no other text.",
+        messages: [{ role: "user", content: prompt }] }), signal);
+      const text = (d.content || []).filter((c) => c && c.type === "text").map((c) => c.text).join("");
+      if (!text.trim()) throw { code: d.stop_reason === "refusal" ? "blocked" : "empty" };
       let value;
       try { value = parseJson(text); } catch (e) { if (!badJson) { badJson = true; continue; } throw e; }
-      if (mi > 0) { state.models = [m].concat(models.filter((x) => x !== m)); S.put("kv", state.models, "models").catch(() => {}); }
-      return { value, model: m.n };
+      if (mi > 0) { state.models = [model].concat(models.filter((x) => x !== model)); S.put("kv", state.models, "models").catch(() => {}); }
+      return { value, model };
     } catch (e) {
       const kind = sortErr(e);
-      if (kind === "model" || kind === "quota0") {
+      if (kind === "model") {
         if (mi + 1 < models.length) { mi++; continue; }
-        if (!relisted) { relisted = true; const fresh = await refreshModels().catch(() => null); if (fresh && fresh.length) { models = fresh.slice(); mi = 0; continue; } }
-        throw { code: kind === "model" ? "nomodel" : "quota", message: e.message };
+        if (!relisted) { relisted = true; const fresh = await listModels().catch(() => []); if (fresh.length) { models = fresh; mi = 0; continue; } }
+        throw { code: "nomodel", message: e.message };
       }
-      if (kind === "busy" && !waited) { waited = true; onStep("Google's AI is busy, trying again"); await sleep(4000); continue; }
-      if (kind === "big" && part && !useMp3) { useMp3 = true; part = await prep(); continue; }
-      if (kind === "bad400") {
-        const cfg = /schema|generation_?config|response_?mime|safety/.test((e.message || "").toLowerCase());
-        if (part && !useMp3 && !cfg) { useMp3 = true; part = await prep(); continue; }
-        if (mode === "schema") { mode = "json"; continue; }
-        if (mode === "json") { mode = "plain"; continue; }
-        if (part && !useMp3) { useMp3 = true; part = await prep(); continue; }
-        throw { code: "rejected", message: e.message };
-      }
+      if (kind === "busy" && waited < 2) { waited++; onStep("Claude is busy, trying again"); await sleep(waited * 5000); continue; }
       throw e && e.code && e.code !== "http" ? e : { code: kind, message: e && e.message };
     }
   }
+  throw { code: "failed" };
 }
 function aiErr(e) {
   switch (e && e.code) {
     case "cancelled": return "";
-    case "nokey": return "The AI key isn't set up yet. Open Setup and add it, then tap Build the sheet.";
-    case "badkey": return "Google didn't accept the AI key. Open Setup and check it.";
-    case "denied": return "Google turned the request down.";
-    case "offline": return "No signal. This is saved on the phone, and the sheet will build when you have service.";
-    case "unreachable": return "Couldn't reach Google's AI. Check your signal and tap Try again.";
-    case "quota": case "quota0": return "Google's free limit is used up for now. Wait a minute and tap Try again.";
-    case "busy": return "Google's AI is busy. Wait a minute and tap Try again.";
-    case "nomodel": return "Google's AI models have changed. Open Setup and tap Check the key, then try again.";
-    case "blocked": return "Google's AI refused this one.";
-    case "rejected": return "Google's AI wouldn't take the request.";
-    case "toolong": return "This recording is too long to send. Trim it to the meeting part in your recorder app and add it again.";
-    case "decode": return "The phone couldn't shrink this recording to send it. Trim it to the meeting part in your recorder app and add it again.";
-    case "empty": case "badjson": return "Google's AI didn't send back a sheet. Tap Try again.";
+    case "nokey": return "The Claude key isn't set up yet. Open Setup and add it. What was heard is saved, so the sheet builds as soon as the key is in.";
+    case "badkey": return "Claude didn't accept the key. Open Setup and check it.";
+    case "nocredit": return "Your Claude API account is out of credit. Add credit at console.anthropic.com, then tap Try again.";
+    case "denied": return "Claude turned the request down.";
+    case "offline": return "No signal. What was heard is saved on the phone, and the sheet builds when you have service.";
+    case "unreachable": return "Couldn't reach Claude. Check your signal and tap Try again.";
+    case "busy": return "Claude is busy right now. Wait a minute and tap Try again.";
+    case "nomodel": return "Claude's models have changed. Open Setup and tap Check the key, then try again.";
+    case "blocked": return "Claude wouldn't build a sheet from this one.";
+    case "rejected": return "Claude wouldn't take the request.";
+    case "big": return "This meeting is too long to send in one go.";
+    case "decode": return "The phone couldn't read this recording. Try a different file.";
+    case "speech_offline": return "The speech engine still needs to download once, and there's no signal. Try again on Wi-Fi.";
+    case "speech_download": return "The speech engine didn't finish downloading. Try again on Wi-Fi.";
+    case "speech": return "The speech engine stopped. Close the app, open it again and tap Try again.";
+    case "noheard": return "No talking was picked up in this recording.";
+    case "empty": case "badjson": return "Claude didn't send back a sheet. Tap Try again.";
     case "empty_sheet": return "No assignments were found in this one.";
     case "nothing": return "There's no recording or text saved for this day.";
     case "save_failed": return "The sheet was built but couldn't be saved on this phone. Free up some space and tap Try again.";
     default: return "Something went wrong building the sheet. Tap Try again.";
   }
 }
-const googleSaid = (e) => (e && e.message ? "Google said: " + String(e.message).slice(0, 240) : "");
+const claudeSaid = (e) => (e && e.message && (e.status || /^(badkey|nocredit|denied|nomodel|rejected|busy|big)$/.test(e.code)) ? "Claude said: " + String(e.message).slice(0, 240) : "");
 
 /* ---------- what the AI is asked ---------- */
 const listBlock = (title, text) => title + ":\n" + (String(text || "").trim() || "(nothing listed yet)") + "\n\n";
@@ -520,30 +458,30 @@ function background(n, boss, hasAudio) {
   return "How the meeting goes: " + boss + " runs it. He calls a person or a crew by name, then says where they are going, what to do there, how to do it, what to bring, and when to call him. Truck drivers get hauling runs: what material, where to load it, where to dump it, how many loads. Other people answer or ask questions now and then. Small talk before the first assignment, between assignments and after the last one is not part of the sheet."
     + (hasAudio ? " Recordings often keep running long after the assignments are done. Ignore that part." : "") + "\n\n"
     + (hasAudio
-      ? "The phone is across a noisy shop, so some words are hard to hear, above all the names of people, places, machines and materials. Use the lists below to work out what was said: a word that sounds like a name on a list is almost always that name. When you still cannot tell what was said, do not guess. Add a short line to \"unsure\" that quotes what it sounded like.\n\n"
+      ? "The transcript was made by a machine from a phone across a noisy shop, so many words are wrong, above all the names of people, places, machines and materials, and some are missing. Work out what was really said from how the words sound: a word that sounds like a name on the lists below is almost always that name (for example \"Strainer\" for Trainer). When you still cannot tell what was said, do not guess. Add a short line to \"unsure\" that quotes the words as heard.\n\n"
       : "Some words in the transcript may be wrong, above all the names of people, places, machines and materials. Use the lists below to work out what was meant: a word that looks like a name on a list is almost always that name. When you still cannot tell, do not guess. Add a short line to \"unsure\" that quotes the words as written.\n\n")
     + listBlock("PEOPLE", n.people) + listBlock("PLACES AND SUPPLIERS", n.places) + listBlock("MACHINES, TOOLS AND MATERIALS", n.gear)
     + (n.me ? "The person using this app is " + n.me + ".\n\n" : "");
 }
 const COMPANY = "an excavating company (site work, septic, water and sewer lines, and trucking of sand, gravel, stone and topsoil)";
-function buildPrompt(day, hasAudio) {
+const machine = (day) => day.source !== "typed";
+function buildPrompt(day) {
   const n = names(), boss = n.boss || "The boss", when = fmtDate(day.date, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
-  return (hasAudio ? "This is a phone recording of the morning crew meeting at " : "This is a rough transcript of the morning crew meeting at ") + COMPANY + ". Turn it into the day's job sheet.\n\n"
-    + background(n, boss, hasAudio)
-    + "Reply with only JSON in this shape:\n" + (hasAudio ? '{"heard": "...", "sheet": SHEET}' : '{"sheet": SHEET}') + "\nwhere SHEET is:\n" + SHAPE + "\n\n"
-    + (hasAudio ? "\"heard\": a plain word-for-word transcript of the assignment part of the meeting, as well as you can hear it. Start a new line each time " + boss + " moves on to another person or crew. Leave out the talk before and after the assignments.\n\n" : "")
-    + "Rules for the sheet:\n" + rules(boss)
-    + (hasAudio ? "The recording was made on " + when + "." : "TRANSCRIPT (" + when + "):\n" + String(day.transcript || "").slice(0, 60000));
+  return (machine(day) ? "This is a speech-to-text transcript of a phone recording of the morning crew meeting at " : "This is a typed account of the morning crew meeting at ") + COMPANY + ". Turn it into the day's job sheet.\n\n"
+    + background(n, boss, machine(day))
+    + "Reply with only JSON in this shape:\n" + SHAPE + "\n\n"
+    + "Rules:\n" + rules(boss)
+    + "TRANSCRIPT (" + when + (machine(day) ? ", [m:ss] is the time into the recording" : "") + "):\n" + String(day.transcript || "").slice(0, 80000);
 }
-function fixPrompt(day, fix, hasAudio) {
+function fixPrompt(day, fix) {
   const n = names(), boss = n.boss || "The boss";
-  return (hasAudio ? "This is a phone recording of the morning crew meeting at " + COMPANY + ". " : "This is about the morning crew meeting at " + COMPANY + ". ")
-    + "A job sheet was already built from it, and the person who uses the sheet says something needs fixing.\n\n"
-    + background(n, boss, hasAudio)
+  return "This is about the morning crew meeting at " + COMPANY + ". A job sheet was already built from "
+    + (machine(day) ? "a speech-to-text transcript of a phone recording of it" : "a typed account of it") + ", and the person who uses the sheet says something needs fixing.\n\n"
+    + background(n, boss, machine(day))
     + "THE SHEET NOW:\n" + JSON.stringify(day.sheet) + "\n\n"
     + (day.transcript ? "WHAT WAS HEARD THE FIRST TIME:\n" + String(day.transcript).slice(0, 30000) + "\n\n" : "")
     + "WHAT NEEDS FIXING, in " + (n.me || "the user") + "'s words:\n" + fix + "\n\n"
-    + "Apply the fix everywhere it matters" + (hasAudio ? ", listening to the recording again where that helps," : "") + " and keep everything else as it is. Reply with only JSON in this shape:\n"
+    + "Apply the fix everywhere it matters, going back to the transcript where that helps, and keep everything else as it is. Reply with only JSON in this shape:\n"
     + '{"sheet": SHEET, "learn": {"people": ["line to add to the People list"], "places": ["line for the Places list"], "gear": ["line for the Machines list"]}}\nwhere SHEET is:\n' + SHAPE + "\n\n"
     + "Put a line in \"learn\" only when the fix teaches a name or term that is not on the lists yet, written like \"Name (how it was misheard) - what it is\". Otherwise leave those arrays empty.\n\n"
     + "Rules for the sheet:\n" + rules(boss);
@@ -577,25 +515,37 @@ async function buildSheet(id, fix) {
   const timer = setInterval(updateBuild, 1000);
   const onStep = (s) => { state.build.step = s; updateBuild(); };
   try {
+    let cur = clone(day);
+    if (!String(cur.transcript || "").trim()) {
+      if (!cur.hasAudio) throw { code: "nothing" };
+      const rec = await S.get("audio", id).catch(() => null);
+      if (!rec || !rec.blob) throw { code: "nothing" };
+      onStep("Getting the recording ready");
+      const pcm = await toPcm(rec.blob, MAX_AI_SECS);
+      if (ctl.signal.aborted) throw { code: "cancelled" };
+      onStep(asr.ready ? "Listening to the meeting on the phone" : "Starting the speech engine");
+      const lines = await transcribe(pcm, MAX_AI_SECS, (m) => {
+        onStep(m.stage === "download" ? "Downloading the speech engine (" + Math.round(m.done / 1048576) + " of " + Math.round(m.total / 1048576) + " MB, one time only)"
+          : m.stage === "start" ? "Starting the speech engine"
+          : "Listening to the meeting on the phone: " + Math.min(100, Math.round((m.done / Math.max(1, m.total)) * 100)) + "%");
+      }, ctl.signal);
+      if (!lines.length) throw { code: "noheard" };
+      cur = Object.assign(clone(dayById(id) || cur), { transcript: linesText(lines), heardAt: Date.now() });
+      await saveDay(cur);    // kept, so it never has to listen again
+    }
     if (!state.key) throw { code: "nokey" };
-    const rec = day.hasAudio ? await S.get("audio", id).catch(() => null) : null;
-    const audio = rec && rec.blob ? { blob: rec.blob, name: rec.name || "" } : null;
-    if (!audio && !String(day.transcript || "").trim()) throw { code: "nothing" };
-    const res = await askGoogle({ audio, signal: ctl.signal, onStep,
-      prompt: fix ? fixPrompt(day, fix, !!audio) : buildPrompt(day, !!audio),
-      schema: fix ? FIX_SCHEMA : audio ? BUILD_SCHEMA : TYPED_SCHEMA });
+    const res = await askClaude({ signal: ctl.signal, onStep, prompt: fix ? fixPrompt(cur, fix) : buildPrompt(cur) });
     const v = res.value || {};
     const sheet = normalizeSheet(v.sheet && !v.assignments ? v.sheet : v);
-    const next = Object.assign(clone(dayById(id) || day), { sheet, builtAt: Date.now(), model: res.model });
-    if (!fix && audio && typeof v.heard === "string" && v.heard.trim()) next.transcript = v.heard.trim();
+    const next = Object.assign(clone(dayById(id) || cur), { sheet, builtAt: Date.now(), model: res.model });
     if (fix) next.fixes = (next.fixes || []).concat([fix]).slice(-20);
     try { await saveDay(next); } catch (e) { throw { code: "save_failed" }; }
     if (fix && v.learn) await learnNames(v.learn);
     if (fix) state.fixText = "";
     state.build = Object.assign({}, IDLE_BUILD);
   } catch (e) {
-    if (e && e.code === "offline") waiting.add(id);
-    state.build = Object.assign({}, IDLE_BUILD, { id, status: "failed", err: aiErr(e), said: googleSaid(e), fix: !!fix });
+    if (e && (e.code === "offline" || e.code === "unreachable")) waiting.add(id);
+    state.build = Object.assign({}, IDLE_BUILD, { id, status: "failed", err: aiErr(e), said: claudeSaid(e), fix: !!fix });
   } finally { clearInterval(timer); render(); }
 }
 function updateBuild() {
@@ -619,33 +569,35 @@ async function learnNames(learn) {
   await S.put("kv", clone(n), "names").catch(() => {});
 }
 
-/* ---------- the AI key ---------- */
+/* ---------- the Claude key ---------- */
 async function checkKey() {
   const su = state.setup, k = su.draft.trim();
   if (!k) { su.ok = false; su.msg = "Paste the key in the box first."; su.said = ""; render(); return; }
   su.busy = true; su.msg = ""; su.said = ""; render();
-  const prev = state.key; state.key = k;
   try {
     let ranked = [];
-    try { ranked = rankModels(await listModels()); }
+    try { ranked = await listModels(k); }
     catch (e) { const kind = sortErr(e); if (kind === "badkey" || kind === "offline" || kind === "unreachable" || kind === "denied") throw { code: kind, message: e.message }; }
-    if (!ranked.length) ranked = DEFAULT_MODELS.map((n) => ({ n, gc: true }));
+    const order = DEFAULT_MODELS.filter((m) => !ranked.length || ranked.indexOf(m) >= 0).concat(ranked.filter((m) => DEFAULT_MODELS.indexOf(m) < 0));
     let good = null, last = null;
-    for (const m of ranked.slice(0, 5)) {     // one tiny question, to find a model this key can really use
-      try { await callModel(m, null, "Reply with the single word OK.", "plain", null); good = m; break; }
-      catch (e) { last = e; const kind = sortErr(e); if (kind === "badkey" || kind === "offline" || kind === "unreachable") throw { code: kind, message: e.message }; }
+    for (const m of order.slice(0, 5)) {     // a one-word question, to be sure the key can really use Claude (costs a fraction of a cent)
+      try { await cFetch("/messages", JSON.stringify({ model: m, max_tokens: 5, messages: [{ role: "user", content: "Reply with OK." }] }), null, k); good = m; break; }
+      catch (e) { last = e; const kind = sortErr(e); if (kind !== "model") throw { code: kind, message: e.message }; }
     }
     if (!good) throw { code: sortErr(last), message: last && last.message };
-    state.models = [good].concat(ranked.filter((x) => x !== good));
+    state.key = k; state.models = [good].concat(order.filter((x) => x !== good));
     await S.put("kv", k, "key"); await S.put("kv", state.models, "models");
-    su.draft = ""; su.ok = true; su.msg = "The key works. Sheets will be built with " + good.n + ".";
+    su.draft = ""; su.ok = true; su.msg = "The key works. Sheets will be built by " + good + ".";
+    const w = state.days.find((x) => !x.sheet);
+    if (w && state.build.status !== "working") waiting.add(w.id);
   } catch (e) {
-    state.key = prev; su.ok = false; su.said = googleSaid(e);
-    su.msg = e.code === "badkey" ? "Google didn't accept that key. Copy it again from Google and paste the whole thing."
+    su.ok = false; su.said = claudeSaid(e);
+    su.msg = e.code === "badkey" ? "Claude didn't accept that key. Copy it again and paste the whole thing (it starts with sk-ant-)."
+      : e.code === "nocredit" ? "The key is fine, but the account has no credit yet. Add credit under Billing at console.anthropic.com, then check the key again."
       : e.code === "offline" ? "No signal. Try again when you have service."
-      : e.code === "unreachable" ? "Couldn't reach Google. Check your signal and try again."
-      : e.code === "quota" || e.code === "quota0" ? "The key is fine, but Google's free limit is used up for now. Try again in a minute."
-      : "Google wouldn't use that key for the AI.";
+      : e.code === "unreachable" ? "Couldn't reach Claude. Check your signal and try again."
+      : e.code === "busy" ? "Claude is busy right now. Try again in a minute."
+      : "Claude wouldn't use that key.";
   }
   su.busy = false; render();
 }
@@ -795,11 +747,11 @@ function homeView() {
   if (state.update && !recBusy()) out.push(h("div", { class: "plain banner" }, h("p", null, "A newer version of the app is ready."), h("button", { class: "btn", type: "button", onclick: () => location.reload() }, "Update now")));
   if (state.flash) out.push(note(state.flash));
   if (!recBusy() && !state.key) out.push(h("div", { class: "plain banner" },
-    h("p", null, h("strong", null, "One-time setup. "), "The app needs an AI key before it can build sheets. You can record without it, and the recording waits on the phone."),
+    h("p", null, h("strong", null, "One-time setup. "), "The app needs a Claude key and its speech engine before it can build sheets. You can record without them, and the recording waits on the phone."),
     h("button", { class: "btn", type: "button", onclick: () => { usage().then(render); go({ view: "setup" }); } }, "Set it up")));
   out.push(recCard());
   if (recBusy()) return out;
-  if (state.key && !names().people.trim()) out.push(note("Your names lists are empty, so the AI will have to guess at names. Load your setup file in Setup, or fill them in under Names."));
+  if (state.key && !names().people.trim()) out.push(note("Your names lists are empty, so Claude will have to guess at names. Load your setup file in Setup, or fill them in under Names."));
   out.push(installCard());
   if (!state.days.length) { out.push(h("p", { class: "muted" }, "No meetings yet. Record your first one.")); return out; }
   const latest = state.days[0];
@@ -875,9 +827,10 @@ function dayView() {
   if (mineBuild && b.status === "failed" && b.err) out.push(note(b.err, false, b.said));
   if (!day.sheet) {
     if (!working) out.push(h("div", { class: "plain" },
-      h("p", null, day.hasAudio ? "The recording is saved on this phone" + (day.audioSecs ? " (" + clock(day.audioSecs * 1000) + ")" : "") + ". The sheet isn't built yet." : "What was said is saved. The sheet isn't built yet."),
-      state.key ? h("div", null, h("button", { class: "btn", type: "button", onclick: () => buildSheet(day.id) }, mineBuild && b.status === "failed" ? "Try again" : "Build the sheet"))
-        : h("div", null, h("button", { class: "btn", type: "button", onclick: () => { usage().then(render); go({ view: "setup" }); } }, "Set up the AI key"))));
+      h("p", null, day.hasAudio ? "The recording is saved on this phone" + (day.audioSecs ? " (" + clock(day.audioSecs * 1000) + ")" : "") + "." + (day.transcript ? " It's been turned into words, but the sheet isn't built yet." : " The sheet isn't built yet.") : "What was said is saved. The sheet isn't built yet."),
+      h("div", { class: "row" },
+        h("button", { class: "btn", type: "button", onclick: () => buildSheet(day.id) }, mineBuild && b.status === "failed" ? "Try again" : day.transcript || state.key ? "Build the sheet" : "Turn it into words"),
+        state.key ? null : h("button", { class: "btn ghost", type: "button", onclick: () => { usage().then(render); go({ view: "setup" }); } }, "Set up the Claude key"))));
   } else {
     out.push(sheetBlocks(day.sheet));
     out.push(h("div", { class: "row" },
@@ -887,16 +840,17 @@ function dayView() {
       state.copyText === "ok" ? null : h("textarea", { id: "copy-box", readonly: true, value: state.copyText })));
     if (state.key) out.push(h("div", { class: "field" },
       h("label", { for: "fix-box" }, "Something wrong?"),
-      h("span", { class: "hint" }, "Say what to fix in your own words, like a name it got wrong." + (day.hasAudio ? " It listens to the recording again and learns names for next time." : " It learns names for next time.")),
+      h("span", { class: "hint" }, "Say what to fix in your own words, like a name it got wrong. Claude fixes the sheet and learns names for next time."),
       h("textarea", { id: "fix-box", value: state.fixText, placeholder: "Example: \"Woochi\" is Butch. The hay job was in Cleverdale.", oninput: (e) => { state.fixText = e.target.value; } }),
       h("div", null, h("button", { class: "btn", type: "button", disabled: working, onclick: () => { const t = state.fixText.trim(); if (t) { state.flash = ""; buildSheet(day.id, t); } } }, "Fix the sheet"))));
   }
   out.push(h("details", { id: "said" }, h("summary", null, "What was said"),
     h("div", { class: "said-box" },
       day.hasAudio ? h("div", { id: "player-slot" }, h("p", { class: "muted small" }, "Loading the recording…")) : null,
-      h("p", { class: "heard" }, day.transcript || (day.hasAudio ? "The written version shows up here once the sheet is built." : "Nothing was saved for this day.")))));
+      h("p", { class: "heard" }, day.transcript || (day.hasAudio ? "The written version shows up here once the recording has been turned into words." : "Nothing was saved for this day.")))));
   out.push(h("div", { class: "row" },
     day.sheet && state.key ? h("button", { class: "btn ghost", type: "button", disabled: working, onclick: () => buildSheet(day.id) }, "Build it again") : null,
+    day.hasAudio && day.transcript && day.source !== "typed" ? h("button", { class: "btn ghost", type: "button", disabled: working, onclick: async () => { const d = Object.assign(clone(day), { transcript: "" }); await saveDay(d); buildSheet(day.id); } }, "Listen again") : null,
     state.confirmDelete ? [h("span", null, "Delete this day for good?"), h("button", { class: "btn danger", type: "button", onclick: () => removeDay(day.id) }, "Yes, delete"), h("button", { class: "btn ghost", type: "button", onclick: () => { state.confirmDelete = false; render(); } }, "Keep it")]
       : h("button", { class: "btn danger", type: "button", disabled: working, onclick: () => { state.confirmDelete = true; render(); } }, "Delete this day")));
   return out;
@@ -920,7 +874,7 @@ async function saveTyped() {
     const id = freshId(date);
     await saveDay({ id, date, createdAt: Date.now(), source: "typed", hasAudio: false, transcript: text, sheet: null });
     state.type = { date: todayStr(), text: "", err: "" };
-    goReplace({ view: "day", id }); buildSheet(id);
+    goReplace({ view: "day", id }); if (state.key) buildSheet(id);
   } catch (e) { t.err = "Couldn't save it on this phone. Free up some space and try again."; render(); }
 }
 function addView() {
@@ -930,10 +884,10 @@ function addView() {
     h("div", { class: "field" }, h("label", { for: "add-file" }, "The recording"),
       h("input", { type: "file", id: "add-file", accept: "audio/*,video/mp4,.m4a,.mp3,.wav,.aac,.ogg,.oga,.opus,.webm,.flac,.3gp,.amr",
         onchange: (e) => { const f = e.target.files && e.target.files[0]; a.file = f || null; a.err = ""; if (f && f.lastModified) a.date = dstr(new Date(f.lastModified)); render(); } }),
-      a.file ? h("span", { class: "hint" }, a.file.name + " · " + mb(a.file.size) + (a.file.size > INLINE_MAX ? ". It's a long one, so only the first 20 minutes go to the AI." : "")) : null),
+      a.file ? h("span", { class: "hint" }, a.file.name + " · " + mb(a.file.size) + (a.file.size > 30 * 1048576 ? ". It's a long one, so only the first 20 minutes are listened to." : "")) : null),
     a.file ? h("div", { class: "field" }, h("label", { for: "add-date" }, "Which day was the meeting"), h("input", { type: "date", id: "add-date", value: a.date, oninput: (e) => { a.date = e.target.value; } })) : null,
     a.err ? note(a.err) : null,
-    a.file ? h("div", null, h("button", { class: "btn", type: "button", disabled: a.busy, onclick: saveAdded }, state.key ? "Build the sheet" : "Save it")) : null];
+    a.file ? h("div", null, h("button", { class: "btn", type: "button", disabled: a.busy, onclick: saveAdded }, "Save it and build the sheet")) : null];
 }
 async function saveAdded() {
   const a = state.add; if (!a.file || a.busy) return;
@@ -969,33 +923,45 @@ async function saveNames() {
   render();
 }
 function setupView() {
-  const su = state.setup, model = state.models[0] && state.models[0].n;
+  const su = state.setup, model = state.models[0], sp = asr.prog;
+  const speechBusy = !!asr.loading && !asr.ready;
   return [h("div", { class: "day-h" }, h("h2", null, "Setup")),
-    h("h3", { class: "sec-h" }, "The AI key"),
-    state.key ? note("The key is on this phone" + (model ? ". Sheets are built with " + model + "." : "."), true) : null,
+    h("h3", { class: "sec-h" }, "Claude key"),
+    state.key ? note("The key is on this phone" + (model ? ". Sheets are built by " + model + "." : "."), true) : null,
     h("div", { class: "plain" },
-      h("p", null, "The app sends each recording to Google's AI (Gemini) to turn it into the sheet. For that it needs a key from Google, which is free for this much use."),
+      h("p", null, "Claude builds the sheets. A downloaded app can't use your Claude subscription, so it needs a Claude API key. The API is billed separately from the subscription, pay as you go: a meeting costs a few cents."),
       h("ol", { class: "howto" },
-        h("li", null, h("span", null, "Tap ", h("strong", null, "Get a key from Google"), " and sign in with your Google account.")),
-        h("li", null, h("span", null, "Tap ", h("strong", null, "Create API key"), " and copy the key.")),
+        h("li", null, h("span", null, "Tap ", h("strong", null, "Get a Claude key"), " and sign in or make an account at console.anthropic.com.")),
+        h("li", null, h("span", null, "Under ", h("strong", null, "Billing"), ", add a little credit ($5 lasts a long time).")),
+        h("li", null, h("span", null, "Under ", h("strong", null, "API keys"), ", tap ", h("strong", null, "Create key"), " and copy it.")),
         h("li", null, h("span", null, "Come back here, paste it in the box and tap ", h("strong", null, "Check the key"), "."))),
-      h("div", null, h("a", { class: "btn ghost", href: KEY_URL, target: "_blank", rel: "noopener" }, "Get a key from Google")),
-      h("p", { class: "muted small" }, "The key is kept on this phone only. Don't share it. On Google's free plan, Google may use what's sent to improve its products.")),
+      h("div", { class: "row" },
+        h("a", { class: "btn ghost", href: KEY_URL, target: "_blank", rel: "noopener" }, "Get a Claude key"),
+        h("a", { class: "btn ghost", href: BILLING_URL, target: "_blank", rel: "noopener" }, "Add credit")),
+      h("p", { class: "muted small" }, "The key is kept on this phone only. Don't share it. Only the written words of the meeting go to Claude, never the recording.")),
     h("div", { class: "field" }, h("label", { for: "key-box" }, state.key ? "Put in a different key" : "Paste the key here"),
-      h("input", { type: "password", id: "key-box", autocomplete: "off", autocapitalize: "off", spellcheck: "false", value: su.draft, oninput: (e) => { su.draft = e.target.value; } })),
+      h("input", { type: "password", id: "key-box", autocomplete: "off", autocapitalize: "off", spellcheck: "false", placeholder: "sk-ant-…", value: su.draft, oninput: (e) => { su.draft = e.target.value; } })),
     su.msg ? note(su.msg, su.ok === true, su.said) : null,
     h("div", { class: "row" },
-      h("button", { class: "btn", type: "button", disabled: su.busy, onclick: checkKey }, su.busy ? "Checking with Google…" : "Check the key"),
+      h("button", { class: "btn", type: "button", disabled: su.busy, onclick: checkKey }, su.busy ? "Checking with Claude…" : "Check the key"),
       state.key ? h("button", { class: "btn danger", type: "button", disabled: su.busy, onclick: forgetKey }, "Take the key off this phone") : null),
+    h("h3", { class: "sec-h" }, "Speech engine"),
+    h("div", { class: "plain" },
+      h("p", null, "The app turns the recording into words right here on the phone, so the recording never leaves it. The engine is a one-time download of about " + SPEECH_MB + " MB. Use Wi-Fi."),
+      asr.ready || (state.speechKept && !speechBusy && !asr.err) ? note("The speech engine is on this phone" + (asr.threads > 1 ? " and uses " + asr.threads + " cores." : "."), true)
+        : speechBusy ? h("div", { class: "stack", style: "gap:8px" }, h("p", { id: "speech-line" }, "Getting the speech engine"), h("div", { class: "bar" }, h("i")))
+        : h("div", { class: "stack", style: "gap:8px" },
+            asr.err ? note(asr.err === "offline" ? "No signal. Try again on Wi-Fi." : "The download didn't finish. Try again on Wi-Fi.") : null,
+            h("div", null, h("button", { class: "btn", type: "button", onclick: () => { asr.err = ""; loadSpeech().catch(() => {}).then(render); render(); } }, state.speechKept ? "Start the speech engine" : "Download the speech engine")))),
     h("h3", { class: "sec-h" }, "Backup and setup files"),
-    h("p", { class: "muted small" }, "Sheets, names and recordings live on this phone only" + (su.used ? " (" + su.used + " so far)" : "") + ". A backup file holds the sheets and names lists."),
+    h("p", { class: "muted small" }, "Sheets, names and recordings live on this phone only" + (su.used ? " (" + su.used + " so far, with the speech engine)" : "") + ". A backup file holds the sheets and names lists."),
     h("div", { class: "row" },
       h("button", { class: "btn ghost", type: "button", onclick: saveBackup }, "Save a backup file"),
       h("button", { class: "btn ghost", type: "button", onclick: () => { const i = $("#load-file"); if (i) i.click(); } }, "Load a backup or setup file"),
       h("button", { class: "btn ghost", type: "button", onclick: clearOldRecordings }, "Clear recordings older than 30 days")),
     h("input", { type: "file", id: "load-file", accept: ".json,application/json,text/plain", hidden: true, onchange: (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; loadBackup(f); } }),
     su.bmsg ? note(su.bmsg, su.bok === true) : null,
-    h("p", { class: "foot" }, "Version " + VERSION)];
+    h("p", { class: "foot" }, "Version " + VERSION + ". Speech engine: NVIDIA Parakeet TDT 110M (CC-BY-4.0), run with ONNX Runtime.")];
 }
 
 /* ---------- drawing ---------- */
@@ -1031,11 +997,12 @@ window.addEventListener("appinstalled", () => { state.installEvt = null; state.s
 async function boot() {
   state.standalone = isStandalone();
   try {
-    const [days, nm, key, models] = await Promise.all([S.all("days"), S.get("kv", "names"), S.get("kv", "key"), S.get("kv", "models")]);
+    const [days, nm, key, models, sp] = await Promise.all([S.all("days"), S.get("kv", "names"), S.get("kv", "key"), S.get("kv", "models"), S.get("kv", "speech-ready")]);
+    state.speechKept = !!sp;
     state.days = sortDays(days || []);
     if (nm && typeof nm === "object") state.names = Object.assign({}, EMPTY_NAMES, nm);
     state.key = typeof key === "string" ? key : "";
-    state.models = Array.isArray(models) ? models.filter((m) => m && m.n) : [];
+    state.models = Array.isArray(models) ? models.filter((m) => typeof m === "string" && /^claude-/.test(m)) : [];
     await recoverCutOff();
   } catch (e) { state.storeErr = true; }
   state.ready = true;

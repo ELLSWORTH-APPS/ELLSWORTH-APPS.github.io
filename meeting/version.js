@@ -1,1 +1,1 @@
-self.MM_VERSION = "2026.11.22-8cf348";
+self.MM_VERSION = "2026.11.22-0d73ef";
