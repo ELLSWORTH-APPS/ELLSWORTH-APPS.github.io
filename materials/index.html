@@ -138,6 +138,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
 .chip .pip { position: static; box-shadow: none; margin: 0 -6px 0 0; }
 .subs { display: flex; gap: 4px; margin: 4px var(--g) 12px; padding: 4px; border-radius: 24px; background: rgba(22, 33, 27, .08); overflow-x: auto; scrollbar-width: none; }
 .subs::-webkit-scrollbar { display: none; }
+.subs.many { flex-wrap: wrap; border-radius: 22px; }
 .sub { flex: 1 0 auto; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 40px; padding: 0 12px; border: 0; border-radius: 20px; background: none; font: 600 15.5px/1 var(--d); color: var(--ink-2); white-space: nowrap; }
 .sub span { font: 700 12px/1 var(--f); color: var(--ink-3); }
 .sub[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(22, 33, 27, .2); }
@@ -722,7 +723,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     const maxOrder = (cat, spec) => { let m = -1, any = -1; items.forEach(x => { if (x.cat === cat) { any = Math.max(any, x.order); if (!spec || x.spec === spec) m = Math.max(m, x.order); } }); return m >= 0 ? m : any >= 0 ? any : 1e6; };
     for (const op of D.outbox) {
       if (op.t === "group+" && !secs.some(s => s.cat.toLowerCase() === String(op.cat).toLowerCase())) secs.push({ cat: op.cat, pending: true });
-      if (op.t === "item+") items.set("new-" + op.id, { key: "new-" + op.id, id: "", cat: op.cat, spec: op.spec || "", name: op.desc, desc: op.desc, nick: op.nick || "", unit: op.unit || "", supplier: op.supplier || "", status: "OK", order: maxOrder(op.cat, op.spec) + 0.001 * (D.outbox.indexOf(op) + 1), pending: true, adding: true, _hay: null });
+      if (op.t === "item+") items.set("new-" + op.id, { key: "new-" + op.id, id: "", cat: op.cat, spec: op.spec || "", tab: op.tab || "", name: op.desc, desc: op.desc, nick: op.nick || "", unit: op.unit || "", supplier: op.supplier || "", status: "OK", order: maxOrder(op.cat, op.spec) + 0.001 * (D.outbox.indexOf(op) + 1), pending: true, adding: true, _hay: null });
     }
     S.items = items;
     S.sections = secs;
@@ -863,6 +864,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
 
   // A long section splits into tabs by class (LD, Sch 40, SDR 35) when every item in it has one.
   function classTabs(items) {
+    if (items.some(it => it.tab)) { const t = new Map(); for (const it of items) { const k = it.tab || "Other"; t.set(k, (t.get(k) || 0) + 1); } return t.size > 1 ? [...t.entries()] : []; }
     if (items.length < 8) return [];
     const by = new Map();
     for (const it of items) { if (!it.spec) return []; by.set(it.spec, (by.get(it.spec) || 0) + 1); }
@@ -928,11 +930,12 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     const tabs = classTabs(items);
     let sub = S.sub.get(S.cat) || "";
     if (sub && !tabs.some(t => t[0] === sub)) sub = "";
-    const add = spec => canAdd() ? `<button type="button" class="row addrow" data-action="additem" data-spec="${esc(spec)}"><span class="plus">${icon("plus")}</span><span class="txt"><span class="nm">Add ${spec ? esc(spec) + " " : ""}material</span></span></button>` : "";
+    const add = spec => canAdd() ? `<button type="button" class="row addrow" data-action="additem" data-spec="${esc(spec)}" data-by="${items.some(it => it.tab) ? "tab" : "spec"}"><span class="plus">${icon("plus")}</span><span class="txt"><span class="nm">Add ${spec ? esc(spec) + " " : ""}material</span></span></button>` : "";
     const slab = (list, spec) => list.length || canAdd() ? `<div class="rows">${list.map(rowHtml).join("")}${add(spec || "")}</div>` : `<div class="empty"><b>Nothing in ${esc(S.cat)} yet.</b>Items show up here once they're added to this group in the master sheet.</div>`;
     if (!tabs.length) return slab(items);
-    const of = v => items.filter(it => it.spec === v);
-    return `<div class="subs" role="tablist" aria-label="Class">${[["", items.length]].concat(tabs).map(([v, n]) => `<button type="button" class="sub" role="tab" data-action="sub" data-v="${esc(v)}" aria-selected="${v === sub}">${esc(v || "All")}<span>${n}</span></button>`).join("")}</div>
+    const byTab = items.some(it => it.tab);
+    const of = v => items.filter(it => byTab ? (it.tab || "Other") === v : it.spec === v);
+    return `<div class="subs${tabs.length > 3 ? " many" : ""}" role="tablist" aria-label="${byTab ? "Tabs" : "Class"}">${[["", items.length]].concat(tabs).map(([v, n]) => `<button type="button" class="sub" role="tab" data-action="sub" data-v="${esc(v)}" aria-selected="${v === sub}">${esc(v || "All")}<span>${n}</span></button>`).join("")}</div>
       ${sub ? slab(of(sub), sub) : tabs.map(([v]) => `<h3 class="cls-h">${esc(v)}</h3>${slab(of(v), v)}`).join("")}`;
   }
 
@@ -1242,7 +1245,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     const a = S.adding, el = $("#sheet");
     el.hidden = false; $("#scrim").hidden = false; document.body.style.overflow = "hidden";
     const sups = [...new Set([...S.items.values()].map(it => it.supplier).filter(Boolean))].sort();
-    const near = [...S.items.values()].filter(it => it.cat === a.cat && (!a.spec || it.spec === a.spec) && !it.adding);
+    const near = [...S.items.values()].filter(it => it.cat === a.cat && (!a.spec || it.spec === a.spec) && (!a.tab || (it.tab || "Other") === a.tab) && !it.adding);
     const ex = near.length ? near[near.length - 1].name : "";
     const unit0 = near.length ? near[near.length - 1].unit : "ea";
     el.innerHTML = a.kind === "group" ? `<div class="grab"></div>
@@ -1252,7 +1255,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
         <label class="field"><span>Group name</span><input name="cat" maxlength="40" required placeholder='Like Gloves or 8" pipe'></label>
         <button class="btn go big" type="submit" style="margin-top:16px">${icon("plus")}Add group</button>
       </form>` : `<div class="grab"></div>
-      <div class="sh-top"><div class="t"><h2>Add to ${esc(a.cat)}${a.spec ? ", " + esc(a.spec) : ""}</h2><p>It goes in the Materials tab with the others${a.spec ? " in " + esc(a.spec) : ""}.</p></div>
+      <div class="sh-top"><div class="t"><h2>Add to ${esc(a.cat)}${a.spec || a.tab ? ", " + esc(a.spec || a.tab) : ""}</h2><p>It goes in the Materials tab with the others${a.spec || a.tab ? " in " + esc(a.spec || a.tab) : ""}.</p></div>
         <button type="button" class="x-btn" data-action="close" aria-label="Close">${icon("x")}</button></div>
       <form data-form="additem" autocomplete="off">
         <label class="field"><span>What it is, written out (this is the name everyone sees)</span><input name="desc" maxlength="120" required placeholder="${esc(ex ? "Like " + ex : "Like Hi-vis vest, size XL")}"></label>
@@ -1485,7 +1488,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     else if (act === "clear") { S.filter = ""; S.q = ""; $("#q").value = ""; $("#qx").hidden = true; renderStock(); navSync(); }
     else if (act === "cat") goCat(a.dataset.cat);
     else if (act === "addgroup") openAdd({ kind: "group" });
-    else if (act === "additem") openAdd({ kind: "item", cat: S.cat, spec: a.dataset.spec || "" });
+    else if (act === "additem") openAdd({ kind: "item", cat: S.cat, spec: a.dataset.by === "tab" ? "" : a.dataset.spec || "", tab: a.dataset.by === "tab" ? a.dataset.spec || "" : "" });
     else if (act === "sub") { S.sub.set(S.cat, a.dataset.v); renderStock(); listTop(); }
     else if (act === "copy") copyText(a.dataset.text, a.dataset.msg);
     else if (act === "step") {
@@ -1527,7 +1530,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
       const desc = v("desc");
       if (!desc) return;
       if ([...S.items.values()].some(it => it.cat === a.cat && it.name.toLowerCase() === desc.toLowerCase())) { toast(desc + " is already in " + a.cat + "."); return; }
-      queue({ t: "item+", cat: a.cat, spec: a.spec || "", desc: desc, nick: v("nick"), unit: v("unit"), supplier: v("supplier") });
+      queue({ t: "item+", cat: a.cat, spec: a.spec || "", tab: a.tab === "Other" ? "" : a.tab || "", desc: desc, nick: v("nick"), unit: v("unit"), supplier: v("supplier") });
       S.adding = null; closeItem();
       toast("Added " + desc + ".");
       return;
