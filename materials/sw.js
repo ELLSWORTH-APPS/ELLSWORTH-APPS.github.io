@@ -1,6 +1,6 @@
 /* Materials background helper. It keeps a copy of the app on this phone so it opens with no signal.
    The build fills in the version and file list below; a new version replaces the old copy. */
-const VERSION = "2026.11.22-59edfd";
+const VERSION = "2026.11.22-b84d74";
 const CACHE = "mat-" + VERSION;
 const FILES = [
  "config.js",

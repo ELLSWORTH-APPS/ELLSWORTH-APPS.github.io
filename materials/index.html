@@ -160,6 +160,14 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
 .row .ds .note { color: var(--ink); font-style: italic; }
 .row .okm { flex: none; display: grid; place-items: center; width: 26px; height: 26px; margin-right: 16px; border-radius: 50%; background: var(--ok-soft); color: var(--ok-txt); }
 .row .okm svg.i { width: 16px; height: 16px; stroke-width: 3; }
+.addrow { min-height: 54px; color: var(--pipe); }
+.addrow .nm { font: 600 16px/1.2 var(--d) !important; }
+.addrow .plus { flex: none; display: grid; place-items: center; width: 30px; height: 30px; margin-left: -4px; border-radius: 50%; border: 2px dashed currentColor; }
+.addrow .plus svg.i { width: 16px; height: 16px; stroke-width: 3; }
+.cat.add { background: transparent; box-shadow: inset 0 0 0 2px var(--line); }
+.cat.add .dot { background: var(--surface); color: var(--pipe); border: 2px dashed var(--pipe); }
+.cat.add .dot svg.i { width: 24px; height: 24px; stroke-width: 2.6; }
+.cat.add .nm { color: var(--pipe); }
 .row.pending .nm::after { content: " · saving"; font-weight: 600; font-size: 13px; color: var(--ink-3); }
 .row.just .flag { transform-origin: 100% 50%; animation: unfurl .5s var(--pop); }
 .row.just .okm { animation: pop .45s var(--pop); }
@@ -397,6 +405,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     text: '<path d="M20.5 12a8.5 8.5 0 0 1-12.4 7.6L3.5 21l1.4-4.4A8.5 8.5 0 1 1 20.5 12z"/>',
     copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
     grid: '<circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="7" r="2.5"/><circle cx="7" cy="17" r="2.5"/><circle cx="17" cy="17" r="2.5"/>',
     down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
     truck: '<path d="M2 6h11v10H2z"/><path d="M13 9h4l4 4v3h-8"/><circle cx="6.5" cy="17.5" r="2"/><circle cx="16.5" cy="17.5" r="2"/>'
@@ -709,8 +718,14 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
         it.lowAt = op.value; it.pending = true;
       }
     }
+    const secs = (st.sections || []).slice();
+    const maxOrder = (cat, spec) => { let m = -1, any = -1; items.forEach(x => { if (x.cat === cat) { any = Math.max(any, x.order); if (!spec || x.spec === spec) m = Math.max(m, x.order); } }); return m >= 0 ? m : any >= 0 ? any : 1e6; };
+    for (const op of D.outbox) {
+      if (op.t === "group+" && !secs.some(s => s.cat.toLowerCase() === String(op.cat).toLowerCase())) secs.push({ cat: op.cat, pending: true });
+      if (op.t === "item+") items.set("new-" + op.id, { key: "new-" + op.id, id: "", cat: op.cat, spec: op.spec || "", name: op.desc, desc: op.desc, nick: op.nick || "", unit: op.unit || "", supplier: op.supplier || "", status: "OK", order: maxOrder(op.cat, op.spec) + 0.001 * (D.outbox.indexOf(op) + 1), pending: true, adding: true, _hay: null });
+    }
     S.items = items;
-    S.sections = st.sections || [];
+    S.sections = secs;
     S.log = log;
     S.people = st.people || [];
     S.alerts = st.alerts || [];
@@ -857,7 +872,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
   function renderStock() {
     const all = itemsInOrder();
     const q = S.q.trim();
-    if (S.cat && !all.some(it => it.cat === S.cat)) S.cat = null;      // renamed or emptied in the sheet
+    if (S.cat && !S.sections.some(s => s.cat === S.cat)) S.cat = null;      // renamed or gone from the sheet
     const mode = q || S.filter ? "find" : S.cat ? "cat" : "home";
     html($("#qrBox"), mode === "home" ? qrCard() : "");
     const counts = tallyOf(all);
@@ -897,7 +912,8 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
   }
 
   function tilesHtml(all) {
-    return `<div class="cats${S.intro ? " intro" : ""}">${S.sections.map((s, i) => {
+    return `<div class="cats${S.intro ? " intro" : ""}">${(canAdd() ? S.sections.concat([{ add: true }]) : S.sections).map((s, i) => {
+      if (s.add) return `<button type="button" class="cat add" data-action="addgroup" style="--n:${i}"><span class="dot">${icon("plus")}</span><span class="txt"><span class="nm">Add a group</span><span class="ds">A new section</span></span></button>`;
       const c = tallyOf(inCat(all, s.cat));
       return `<button type="button" class="cat" data-action="cat" data-cat="${esc(s.cat)}" style="--n:${i}">${dot(s.cat, pip(c))}<span class="txt"><span class="nm">${esc(s.cat)}</span><span class="ds">${sumHtml(c)}</span></span></button>`;
     }).join("")}</div>`;
@@ -912,11 +928,12 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     const tabs = classTabs(items);
     let sub = S.sub.get(S.cat) || "";
     if (sub && !tabs.some(t => t[0] === sub)) sub = "";
-    const slab = list => `<div class="rows">${list.map(rowHtml).join("")}</div>`;
+    const add = spec => canAdd() ? `<button type="button" class="row addrow" data-action="additem" data-spec="${esc(spec)}"><span class="plus">${icon("plus")}</span><span class="txt"><span class="nm">Add ${spec ? esc(spec) + " " : ""}material</span></span></button>` : "";
+    const slab = (list, spec) => list.length || canAdd() ? `<div class="rows">${list.map(rowHtml).join("")}${add(spec || "")}</div>` : `<div class="empty"><b>Nothing in ${esc(S.cat)} yet.</b>Items show up here once they're added to this group in the master sheet.</div>`;
     if (!tabs.length) return slab(items);
     const of = v => items.filter(it => it.spec === v);
     return `<div class="subs" role="tablist" aria-label="Class">${[["", items.length]].concat(tabs).map(([v, n]) => `<button type="button" class="sub" role="tab" data-action="sub" data-v="${esc(v)}" aria-selected="${v === sub}">${esc(v || "All")}<span>${n}</span></button>`).join("")}</div>
-      ${sub ? slab(of(sub)) : tabs.map(([v]) => `<h3 class="cls-h">${esc(v)}</h3>${slab(of(v))}`).join("")}`;
+      ${sub ? slab(of(sub), sub) : tabs.map(([v]) => `<h3 class="cls-h">${esc(v)}</h3>${slab(of(v), v)}`).join("")}`;
   }
 
   function rowHtml(it) {
@@ -928,7 +945,7 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     }
     const tag = flagged ? `<span class="flag ${ST[it.status].cls}">${ST[it.status].flag}</span>` : `<span class="okm">${icon("check")}<span class="sr">In stock</span></span>`;
     const qr = waitingQr().some(r => r.item === it.key) ? `<span class="qr-tag">QR</span>` : "";
-    return `<button type="button" class="row${it.pending ? " pending" : ""}${S.flash === it.key ? " just" : ""}" data-action="open" data-key="${esc(it.key)}">
+    return `<button type="button" class="row${it.pending ? " pending" : ""}${S.flash === it.key ? " just" : ""}" data-action="${it.adding ? "none" : "open"}" data-key="${esc(it.key)}">
       <span class="txt"><span class="nm">${esc(it.name)}</span>${sub ? `<span class="ds">${sub}</span>` : ""}</span>${qr}${tag}</button>`;
   }
 
@@ -1218,7 +1235,35 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     const row = key && document.querySelector('[data-action="open"][data-key="' + CSS.escape(key) + '"]');
     if (row) row.focus({ preventScroll: true });
   }
+  const canAdd = () => S.me.isOwner && !S.readOnly;
+  const UNITS = ["ea", "ft", "stick", "box", "bag", "roll", "ton", "yd", "can", "bundle", "tub"];
+  function openAdd(a) { S.adding = a; S.open = "+add"; S.done = null; renderSheet(); navSync(); setTimeout(() => { const i = $("#sheet input"); if (i) i.focus(); }, 60); }
+  function renderAdd() {
+    const a = S.adding, el = $("#sheet");
+    el.hidden = false; $("#scrim").hidden = false; document.body.style.overflow = "hidden";
+    const sups = [...new Set([...S.items.values()].map(it => it.supplier).filter(Boolean))].sort();
+    const near = [...S.items.values()].filter(it => it.cat === a.cat && (!a.spec || it.spec === a.spec) && !it.adding);
+    const ex = near.length ? near[near.length - 1].name : "";
+    const unit0 = near.length ? near[near.length - 1].unit : "ea";
+    el.innerHTML = a.kind === "group" ? `<div class="grab"></div>
+      <div class="sh-top"><div class="t"><h2>Add a group</h2><p>It goes at the bottom of the Materials tab, and in the app with an Add material button.</p></div>
+        <button type="button" class="x-btn" data-action="close" aria-label="Close">${icon("x")}</button></div>
+      <form data-form="addgroup" autocomplete="off">
+        <label class="field"><span>Group name</span><input name="cat" maxlength="40" required placeholder='Like Gloves or 8" pipe'></label>
+        <button class="btn go big" type="submit" style="margin-top:16px">${icon("plus")}Add group</button>
+      </form>` : `<div class="grab"></div>
+      <div class="sh-top"><div class="t"><h2>Add to ${esc(a.cat)}${a.spec ? ", " + esc(a.spec) : ""}</h2><p>It goes in the Materials tab with the others${a.spec ? " in " + esc(a.spec) : ""}.</p></div>
+        <button type="button" class="x-btn" data-action="close" aria-label="Close">${icon("x")}</button></div>
+      <form data-form="additem" autocomplete="off">
+        <label class="field"><span>What it is, written out (this is the name everyone sees)</span><input name="desc" maxlength="120" required placeholder="${esc(ex ? "Like " + ex : "Like Hi-vis vest, size XL")}"></label>
+        <label class="field"><span>What you call it (optional, so search finds it)</span><input name="nick" maxlength="80"></label>
+        <label class="field"><span>Counted by the</span><select name="unit">${UNITS.map(u => `<option${u === (unit0 || "ea") ? " selected" : ""}>${u}</option>`).join("")}</select></label>
+        <label class="field"><span>Supplier (optional)</span><input name="supplier" maxlength="60" list="supList"><datalist id="supList">${sups.map(s => `<option value="${esc(s)}">`).join("")}</datalist></label>
+        <button class="btn go big" type="submit" style="margin-top:16px">${icon("plus")}Add material</button>
+      </form>`;
+  }
   function renderSheet() {
+    if (S.open === "+add") { if (S.adding && S.signedIn) return renderAdd(); S.open = null; closeSheetDom(); return; }
     const it = S.open ? S.items.get(S.open) : null;
     if (!it || !S.signedIn) { if (S.open && !it) S.open = null; closeSheetDom(); return; }
     const el = $("#sheet");
@@ -1439,6 +1484,8 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     else if (act === "filter") { S.filter = S.filter === a.dataset.st ? "" : a.dataset.st; renderStock(); navSync(); }
     else if (act === "clear") { S.filter = ""; S.q = ""; $("#q").value = ""; $("#qx").hidden = true; renderStock(); navSync(); }
     else if (act === "cat") goCat(a.dataset.cat);
+    else if (act === "addgroup") openAdd({ kind: "group" });
+    else if (act === "additem") openAdd({ kind: "item", cat: S.cat, spec: a.dataset.spec || "" });
     else if (act === "sub") { S.sub.set(S.cat, a.dataset.v); renderStock(); listTop(); }
     else if (act === "copy") copyText(a.dataset.text, a.dataset.msg);
     else if (act === "step") {
@@ -1464,6 +1511,27 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     e.preventDefault();
     const kind = f.dataset.form;
     if (kind === "signin") return signIn(f);
+    if (kind === "addgroup" || kind === "additem") {
+      const v = n => (f.elements[n] ? f.elements[n].value : "").trim().replace(/\s+/g, " ");
+      const a = S.adding || {};
+      if (kind === "addgroup") {
+        const cat = v("cat");
+        if (!cat) return;
+        if (S.sections.some(s => s.cat.toLowerCase() === cat.toLowerCase())) { toast("There's already a group called " + cat + "."); return; }
+        queue({ t: "group+", cat: cat });
+        S.adding = null; closeItem();
+        goCat(cat);
+        toast("Added " + cat + ". Now add what goes in it.");
+        return;
+      }
+      const desc = v("desc");
+      if (!desc) return;
+      if ([...S.items.values()].some(it => it.cat === a.cat && it.name.toLowerCase() === desc.toLowerCase())) { toast(desc + " is already in " + a.cat + "."); return; }
+      queue({ t: "item+", cat: a.cat, spec: a.spec || "", desc: desc, nick: v("nick"), unit: v("unit"), supplier: v("supplier") });
+      S.adding = null; closeItem();
+      toast("Added " + desc + ".");
+      return;
+    }
     if (kind === "count") return saveCount(f);
     if (kind === "lowat") return saveLowAt(f);
     if (kind === "myphone") {
