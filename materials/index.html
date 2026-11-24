@@ -161,6 +161,8 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
 .row .ds .note { color: var(--ink); font-style: italic; }
 .row .okm { flex: none; display: grid; place-items: center; width: 26px; height: 26px; margin-right: 16px; border-radius: 50%; background: var(--ok-soft); color: var(--ok-txt); }
 .row .okm svg.i { width: 16px; height: 16px; stroke-width: 3; }
+.row .qn { flex: none; min-width: 30px; text-align: right; font: 600 19px/1 var(--d); color: var(--ink); font-variant-numeric: tabular-nums; }
+.row .qn.zero { color: var(--ink-2); }
 .addrow { min-height: 54px; color: var(--pipe); }
 .addrow .nm { font: 600 16px/1.2 var(--d) !important; }
 .addrow .plus { flex: none; display: grid; place-items: center; width: 30px; height: 30px; margin-left: -4px; border-radius: 50%; border: 2px dashed currentColor; }
@@ -826,6 +828,8 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
   const SPARE = ["#0F8B8D", "#5661D8", "#3F7CAC", "#7647C9", "#B9813D", "#6E7F2F", "#5C7080", "#2F8F4E"];
   const KINDS = [
     [/riser|lid|septic|tank/i, "riser", "#2F8F4E"],
+    [/waterworks|water service/i, "coupling", "#1D6FA8"],
+    [/jobsite|supplies/i, "stake", "#E07A1F"],
     [/misc/i, "tee", "#3F7CAC"],
     [/fitting|elbow|bend/i, "elbow", ""],
     [/pipe/i, "pipe", ""],
@@ -948,8 +952,9 @@ main { padding-bottom: calc(var(--tabs) + 40px + env(safe-area-inset-bottom)); }
     }
     const tag = flagged ? `<span class="flag ${ST[it.status].cls}">${ST[it.status].flag}</span>` : `<span class="okm">${icon("check")}<span class="sr">In stock</span></span>`;
     const qr = waitingQr().some(r => r.item === it.key) ? `<span class="qr-tag">QR</span>` : "";
+    const qv = num(it.qty), qn = qv === null || it.adding ? "" : `<span class="qn${qv <= 0 ? " zero" : ""}">${esc(qv)}<span class="sr"> on hand</span></span>`;
     return `<button type="button" class="row${it.pending ? " pending" : ""}${S.flash === it.key ? " just" : ""}" data-action="${it.adding ? "none" : "open"}" data-key="${esc(it.key)}">
-      <span class="txt"><span class="nm">${esc(it.name)}</span>${sub ? `<span class="ds">${sub}</span>` : ""}</span>${qr}${tag}</button>`;
+      <span class="txt"><span class="nm">${esc(it.name)}</span>${sub ? `<span class="ds">${sub}</span>` : ""}</span>${qn}${qr}${tag}</button>`;
   }
 
   // ---------- getting around Stock
