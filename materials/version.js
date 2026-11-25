@@ -1,1 +1,1 @@
-window.MAT_VERSION = "2026.11.24-9a9839";
+window.MAT_VERSION = "2026.11.25-3e2868";
